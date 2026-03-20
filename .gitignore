@@ -6,12 +6,15 @@ __pycache__/
 *.swo
 *.log
 .cache/
+.gemini/
+.vscode/
 tmp*/
 wandb/
 outputs/
 checkpoints/
 data/
 datasets/
+*.egg-info/
 *.whl
 *.pt
 *.pth

@@ -1,0 +1,10 @@
+# syntax=docker/dockerfile:1.7
+
+ARG BASE_IMAGE=verl-deltaai-verlsd-core:local-arm64
+FROM ${BASE_IMAGE}
+
+COPY docker/deltaai/scripts/check_dependencies.py /opt/verl-deltaai/scripts/check_dependencies.py
+
+RUN python -m pip uninstall -y nx-cugraph cudf-polars ucx-py || true
+
+RUN python /opt/verl-deltaai/scripts/check_dependencies.py

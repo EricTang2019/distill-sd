@@ -1,0 +1,69 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# waste_sd v1 is actor-only distillation.
+critic:
+  enable: false
+
+reward_model:
+  enable: false
+  use_reward_loop: false
+
+algorithm:
+  use_kl_in_reward: false
+
+trainer:
+  val_before_train: false
+
+actor_rollout_ref:
+  actor:
+    use_kl_loss: false
+  rollout:
+    mode: async
+    name: sglang
+
+distill:
+  # training data source:
+  # - online_rollout: generate responses with rollout engine (default)
+  # - offline_teacher_rollout: read prompt/response/(prompt_ids,response_ids) from dataset
+  data_mode: online_rollout # online_rollout | offline_teacher_rollout
+  # divergence between teacher target distribution q and student distribution p
+  loss_type: fkl # fkl | rkl | tvd | teacher_greedy_nll | exact_block_count_wnll
+  # Token weighting rule for dense distillation.
+  # teacher_greedy_nll and exact_block_count_wnll currently require uniform_mean.
+  weighting_mode: waste # waste | uniform_mean | remaining_budget_forward
+  # Optional KL floor coefficient for forward-only remaining-budget weighted soft distillation.
+  kl_floor_coef: 0.0
+  # Optional convex mixing coefficient for forward-only remaining-budget weighted FKL.
+  # Only used when weighting_mode=remaining_budget_forward and loss_type=fkl.
+  #   loss = (1 - rembudget_unweighted_kl_coef) * rembudget_FKL + rembudget_unweighted_kl_coef * unweighted_FKL
+  rembudget_unweighted_kl_coef: 0.0
+  # Optional convex mixing coefficient for exact omega + unweighted forward-KL.
+  # Only used when loss_type=exact_block_count_wnll.
+  #   loss = (1 - exact_unweighted_kl_coef) * exact_wNLL + exact_unweighted_kl_coef * unweighted_FKL
+  exact_unweighted_kl_coef: 0.0
+  # teacher forward backend used inside distill update
+  # - fsdp_ref: use ref FSDP module directly (default, existing behavior)
+  # - local_replica: per-rank local teacher replica, no FSDP collectives on teacher forward
+  teacher_forward_backend: fsdp_ref # fsdp_ref | local_replica
+  # rollout target model source: local_ref (teacher) or actor (student)
+  rollout_target: local_ref # local_ref | actor
+  # Teacher off-policy baselines may require an explicit ref model path.
+  off_policy_require_ref: false
+  # default follows speculative draft-step cap gamma
+  gamma: ${oc.select:actor_rollout_ref.rollout.engine_kwargs.sglang.speculative_num_steps,3}
+  strict: true
+  q_source: local_ref
+  staleness_max_version_gap: 1
+  forward_path: auto # auto | padded_only | remove_padding
+  debug:
+    enable: false
+    dump_dir: ${oc.env:WASTE_SD_DISTILL_DEBUG_DIR,/work5/jingwut/On-Policy-Distillation/verl/outputs/waste_sd_debug/default}
+    max_samples_per_step: 8
+    max_tokens_per_sample: 128
+    include_topk: false

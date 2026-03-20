@@ -1,0 +1,2 @@
+- name: single_turn_agent
+  _target_: recipe.waste_sd.agent_loop.waste_sd_single_turn_agent_loop_v3.WasteSDSingleTurnAgentLoopV3

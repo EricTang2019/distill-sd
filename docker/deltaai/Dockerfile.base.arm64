@@ -1,0 +1,55 @@
+# syntax=docker/dockerfile:1.7
+
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:25.05-py3
+FROM ${BASE_IMAGE}
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+ENV PIP_ROOT_USER_ACTION=ignore \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    VLLM_WORKER_MULTIPROC_METHOD=spawn \
+    CUDA_DEVICE_ORDER=PCI_BUS_ID \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    wget \
+    ca-certificates \
+    build-essential \
+    ninja-build \
+    pkg-config \
+    numactl \
+    libnuma-dev \
+    libibverbs-dev \
+    librdmacm-dev \
+    jq \
+    less \
+    vim \
+    tmux \
+    htop \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m pip install --upgrade \
+    pip \
+    setuptools \
+    wheel \
+    "packaging<=24.2" \
+    pyyaml
+
+WORKDIR /workspace
+
+COPY docker/deltaai/scripts /opt/verl-deltaai/scripts
+COPY docker/deltaai/env.distillsd.versions.yaml /opt/verl-deltaai/env.distillsd.versions.yaml
+COPY docker/deltaai/env.verlsd.versions.yaml /opt/verl-deltaai/env.verlsd.versions.yaml
+COPY docker/deltaai/env.distillsd.pip-freeze.txt /opt/verl-deltaai/env.distillsd.pip-freeze.txt
+COPY docker/deltaai/env.verlsd.pip-freeze.txt /opt/verl-deltaai/env.verlsd.pip-freeze.txt
+COPY docker/deltaai/env.distillsd.conda-explicit.txt /opt/verl-deltaai/env.distillsd.conda-explicit.txt
+COPY docker/deltaai/env.verlsd.conda-explicit.txt /opt/verl-deltaai/env.verlsd.conda-explicit.txt
+COPY docker/deltaai/env.distillsd.constraints.txt /opt/verl-deltaai/env.distillsd.constraints.txt
+COPY docker/deltaai/env.verlsd.constraints.txt /opt/verl-deltaai/env.verlsd.constraints.txt
+
+ENTRYPOINT ["bash", "-lc"]
+CMD ["python --version"]

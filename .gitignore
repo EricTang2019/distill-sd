@@ -31,3 +31,6 @@ datasets/
 *.tar
 *.tar.gz
 *.zip
+
+!verl/trainer/config/data/
+!verl/trainer/config/data/legacy_data.yaml

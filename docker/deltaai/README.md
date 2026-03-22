@@ -40,6 +40,10 @@ freezes used to keep transitive dependency resolution from drifting during image
   - `sglang` training environment
 - `Dockerfile.verlsd.arm64`
   - `vllm` strict-eval environment
+- `Dockerfile.verlsd.sync.arm64`
+  - additive overlay image layered on top of an existing `verlsd` image
+  - intended to close the gap between the published `verlsd` image and the full local `verlsd` package set
+  - leaves the original `base -> verlsd-core -> verlsd` path untouched
 - `scripts/validate_env.py`
   - fails fast if imported versions do not match the target snapshot
 - `scripts/generate_constraints.py`
@@ -131,6 +135,43 @@ DISTILLSD_TAG=myrepo/verl-deltaai-distillsd:arm64 \
 VERLSD_TAG=myrepo/verl-deltaai-verlsd:arm64 \
 bash docker/deltaai/build_deltaai_images.sh
 ```
+
+If you want a safer "do not touch the old core/nodeps path" refresh of the
+published `verlsd` image, build only the sync overlay on top of the already
+published image:
+
+```bash
+BUILD_TARGETS=verlsd-sync \
+VERLSD_SYNC_BASE_IMAGE=jingwutang2023/verl-deltaai-verlsd:20260318 \
+VERLSD_SYNC_TAG=myrepo/verl-deltaai-verlsd-sync:arm64 \
+BUILD_OUTPUT_FLAG=--push \
+bash docker/deltaai/build_deltaai_images.sh
+```
+
+This path only adds:
+
+- `env.verlsd.sync.requirements.txt`
+- `env.verlsd.build-constraints.txt`
+- stricter exact-version validation for the supplemented packages
+
+and does not modify the existing `verlsd-core` or `verlsd` Dockerfiles.
+
+Known arm64 gap today:
+
+- `transformer-engine==2.6.0+c90a720` is not included in the sync overlay
+  because the current arm64 build path cannot resolve a matching distribution.
+  It is tracked in `env.verlsd.sync.gaps.txt`.
+- `megatron-core==0.13.1` is intentionally excluded from the eval-oriented sync
+  overlay because on the current base it forces `numpy<2`, which conflicts with
+  the existing `opencv-python-headless` stack.
+
+The sync Dockerfile also avoids `pip check` because the published base image
+contains wheel metadata that makes `pip check` itself crash before it can report
+real package issues. The sync path relies on:
+
+- `check_dependencies.py`
+- `validate_env.py`
+- `validate_requirements.py`
 
 ## DeltaAI / Apptainer flow
 

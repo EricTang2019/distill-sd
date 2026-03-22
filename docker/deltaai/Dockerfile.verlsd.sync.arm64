@@ -1,0 +1,30 @@
+# syntax=docker/dockerfile:1.7
+
+ARG BASE_IMAGE=jingwutang2023/verl-deltaai-verlsd:20260318
+FROM ${BASE_IMAGE}
+
+ARG SKIP_SYNC_CHECKS=0
+
+ENV PIP_CONSTRAINT=/opt/verl-deltaai/env.verlsd.constraints.txt
+
+COPY docker/deltaai/env.verlsd.build-constraints.txt /opt/verl-deltaai/env.verlsd.build-constraints.txt
+COPY docker/deltaai/env.verlsd.constraints.txt /opt/verl-deltaai/env.verlsd.constraints.txt
+COPY docker/deltaai/env.verlsd.pip-freeze.txt /opt/verl-deltaai/env.verlsd.pip-freeze.txt
+COPY docker/deltaai/env.verlsd.versions.yaml /opt/verl-deltaai/env.verlsd.versions.yaml
+COPY docker/deltaai/env.verlsd.sync.requirements.txt /opt/verl-deltaai/env.verlsd.sync.requirements.txt
+COPY docker/deltaai/scripts/check_dependencies.py /opt/verl-deltaai/scripts/check_dependencies.py
+COPY docker/deltaai/scripts/validate_env.py /opt/verl-deltaai/scripts/validate_env.py
+COPY docker/deltaai/scripts/validate_requirements.py /opt/verl-deltaai/scripts/validate_requirements.py
+
+RUN python -m pip install --use-feature=build-constraint \
+    --build-constraint /opt/verl-deltaai/env.verlsd.build-constraints.txt \
+    --upgrade --upgrade-strategy eager \
+    -r /opt/verl-deltaai/env.verlsd.sync.requirements.txt
+
+RUN if [ "${SKIP_SYNC_CHECKS}" = "1" ]; then \
+        echo "Skipping verlsd-sync post-install checks"; \
+    else \
+        python /opt/verl-deltaai/scripts/check_dependencies.py && \
+        python /opt/verl-deltaai/scripts/validate_env.py /opt/verl-deltaai/env.verlsd.versions.yaml --ignore-python-patch && \
+        python /opt/verl-deltaai/scripts/validate_requirements.py /opt/verl-deltaai/env.verlsd.sync.requirements.txt; \
+    fi

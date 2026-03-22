@@ -9,6 +9,9 @@ DISTILLSD_CORE_TAG="${DISTILLSD_CORE_TAG:-verl-deltaai-distillsd-core:local-arm6
 DISTILLSD_TAG="${DISTILLSD_TAG:-verl-deltaai-distillsd:local-arm64}"
 VERLSD_CORE_TAG="${VERLSD_CORE_TAG:-verl-deltaai-verlsd-core:local-arm64}"
 VERLSD_TAG="${VERLSD_TAG:-verl-deltaai-verlsd:local-arm64}"
+VERLSD_SYNC_BASE_IMAGE="${VERLSD_SYNC_BASE_IMAGE:-jingwutang2023/verl-deltaai-verlsd:20260318}"
+VERLSD_SYNC_TAG="${VERLSD_SYNC_TAG:-verl-deltaai-verlsd-sync:local-arm64}"
+VERLSD_SYNC_SKIP_CHECKS="${VERLSD_SYNC_SKIP_CHECKS:-0}"
 PLATFORM="${PLATFORM:-linux/arm64}"
 BUILD_OUTPUT_FLAG="${BUILD_OUTPUT_FLAG:---load}"
 BUILD_PROGRESS="${BUILD_PROGRESS:-plain}"
@@ -27,6 +30,8 @@ build_child_image() {
   local dockerfile="$1"
   local image_tag="$2"
   local parent_image="$3"
+  shift 3
+  local extra_build_args=("$@")
 
   if uses_local_base_handoff; then
     env -u BUILDX_BUILDER DOCKER_BUILDKIT=1 docker build \
@@ -34,6 +39,7 @@ build_child_image() {
       --platform "${PLATFORM}" \
       --pull=false \
       --build-arg BASE_IMAGE="${parent_image}" \
+      "${extra_build_args[@]}" \
       -f "${dockerfile}" \
       -t "${image_tag}" \
       "${ROOT}"
@@ -43,6 +49,7 @@ build_child_image() {
       --progress "${BUILD_PROGRESS}" \
       --platform "${PLATFORM}" \
       --build-arg BASE_IMAGE="${parent_image}" \
+      "${extra_build_args[@]}" \
       -f "${dockerfile}" \
       -t "${image_tag}" \
       "${ROOT}"
@@ -75,6 +82,14 @@ if build_requested verlsd; then
   build_child_image "${DELTA_DOCKER_DIR}/Dockerfile.verlsd.arm64" "${VERLSD_TAG}" "${VERLSD_CORE_TAG}"
 fi
 
+if build_requested verlsd-sync; then
+  build_child_image \
+    "${DELTA_DOCKER_DIR}/Dockerfile.verlsd.sync.arm64" \
+    "${VERLSD_SYNC_TAG}" \
+    "${VERLSD_SYNC_BASE_IMAGE}" \
+    --build-arg "SKIP_SYNC_CHECKS=${VERLSD_SYNC_SKIP_CHECKS}"
+fi
+
 echo "Build targets: ${BUILD_TARGETS}"
 if build_requested base; then
   echo "Built: ${BASE_TAG}"
@@ -92,4 +107,7 @@ if build_requested verlsd; then
 fi
 if build_requested verlsd-core && ! build_requested verlsd; then
   echo "Built core: ${VERLSD_CORE_TAG}"
+fi
+if build_requested verlsd-sync; then
+  echo "Built sync overlay: ${VERLSD_SYNC_TAG} (base ${VERLSD_SYNC_BASE_IMAGE})"
 fi

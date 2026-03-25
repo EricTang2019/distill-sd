@@ -345,7 +345,6 @@ async def _run_worker_async(
     worker_idx: int,
     worker_jobs: list[dict[str, Any]],
     event_queue,
-    max_concurrent_requests: int,
     engine_config: dict[str, Any],
     sampling_defaults: dict[str, Any],
 ) -> None:
@@ -388,15 +387,8 @@ async def _run_worker_async(
                 "set_strict_rejection_debug_jsonl",
                 args=(engine_config["strict_rejection_debug_jsonl"],),
             )
-    job_iter = iter(worker_jobs)
-    pending: set[asyncio.Task] = set()
-
-    async def _submit_next() -> bool:
-        try:
-            job = next(job_iter)
-        except StopIteration:
-            return False
-        task = asyncio.create_task(
+    pending = [
+        asyncio.create_task(
             _run_single_job(
                 engine,
                 job=job,
@@ -404,19 +396,13 @@ async def _run_worker_async(
                 request_prefix=f"worker_{worker_idx}",
             )
         )
-        pending.add(task)
-        return True
+        for job in worker_jobs
+    ]
 
     try:
-        for _ in range(min(max_concurrent_requests, len(worker_jobs))):
-            await _submit_next()
-
-        while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                result = task.result()
-                event_queue.put(("result", result))
-                await _submit_next()
+        for task in asyncio.as_completed(pending):
+            result = await task
+            event_queue.put(("result", result))
     finally:
         engine.shutdown()
 
@@ -425,7 +411,6 @@ def _worker_main(
     worker_idx: int,
     worker_jobs: list[dict[str, Any]],
     event_queue,
-    max_concurrent_requests: int,
     engine_config: dict[str, Any],
     sampling_defaults: dict[str, Any],
     tmp_dir: str,
@@ -440,7 +425,6 @@ def _worker_main(
                 worker_idx=worker_idx,
                 worker_jobs=worker_jobs,
                 event_queue=event_queue,
-                max_concurrent_requests=max_concurrent_requests,
                 engine_config=engine_config,
                 sampling_defaults=sampling_defaults,
             )
@@ -518,7 +502,6 @@ def main() -> None:
     parser.add_argument("--tmp-dir", default=DEFAULT_TMP_DIR)
     parser.add_argument("--max-prompts", type=int, default=-1)
     parser.add_argument("--samples-per-prompt", type=int, default=1)
-    parser.add_argument("--max-concurrent-requests", type=int, default=16)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--draft-temperature", type=float, default=None)
@@ -661,17 +644,12 @@ def main() -> None:
 
     try:
         for worker_idx, (worker_jobs, engine_config) in enumerate(zip(worker_job_shards, worker_engine_configs, strict=False)):
-            per_worker_concurrency = max(
-                1,
-                (int(args.max_concurrent_requests) + max(1, len(worker_job_shards)) - 1) // max(1, len(worker_job_shards)),
-            )
             process = ctx.Process(
                 target=_worker_main,
                 args=(
                     worker_idx,
                     worker_jobs,
                     event_queue,
-                    per_worker_concurrency,
                     engine_config,
                     sampling_defaults,
                     args.tmp_dir,

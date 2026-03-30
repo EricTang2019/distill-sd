@@ -9,14 +9,15 @@ import sys
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 import requests
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
-from verl.workers.rollout.sglang_rollout.http_server_engine import HttpServerAdapter
+if TYPE_CHECKING:
+    from verl.workers.rollout.sglang_rollout.http_server_engine import HttpServerAdapter
 
 
 DEFAULT_TMP_DIR = "/work5/jingwut/tmp"
@@ -65,21 +66,19 @@ def _launch_teacher_server(
         str(server_kwargs["port"]),
         "--tensor-parallel-size",
         str(server_kwargs["tensor_parallel_size"]),
-        "--dtype",
-        str(server_kwargs["dtype"]),
-        "--log-level",
-        str(server_kwargs["log_level"]),
-        "--attention-backend",
-        str(server_kwargs["attention_backend"]),
-        "--sampling-backend",
-        str(server_kwargs["sampling_backend"]),
-        "--mem-fraction-static",
-        str(server_kwargs["mem_fraction_static"]),
-        "--chunked-prefill-size",
-        str(server_kwargs["chunked_prefill_size"]),
-        "--max-total-tokens",
-        str(server_kwargs["max_total_tokens"]),
     ]
+
+    def _append_optional(flag: str, value: Any) -> None:
+        if value is not None:
+            command.extend([flag, str(value)])
+
+    _append_optional("--dtype", server_kwargs.get("dtype"))
+    _append_optional("--log-level", server_kwargs.get("log_level"))
+    _append_optional("--attention-backend", server_kwargs.get("attention_backend"))
+    _append_optional("--sampling-backend", server_kwargs.get("sampling_backend"))
+    _append_optional("--mem-fraction-static", server_kwargs.get("mem_fraction_static"))
+    _append_optional("--chunked-prefill-size", server_kwargs.get("chunked_prefill_size"))
+    _append_optional("--max-total-tokens", server_kwargs.get("max_total_tokens"))
     if server_kwargs.get("disable_cuda_graph"):
         command.append("--disable-cuda-graph")
     if server_kwargs.get("trust_remote_code"):
@@ -207,7 +206,13 @@ def _extract_response_ids(response: dict[str, Any]) -> list[int]:
     return [int(x) for x in output_ids]
 
 
-def _load_records(data_path: str, *, prompt_key: str, max_prompts: int) -> list[dict[str, Any]]:
+def _load_records(
+    data_path: str,
+    *,
+    prompt_key: str,
+    max_prompts: int,
+    add_rollout_instruction: bool = True,
+) -> list[dict[str, Any]]:
     path = Path(data_path)
     suffix = path.suffix.lower()
     if suffix == ".jsonl":
@@ -238,7 +243,9 @@ def _load_records(data_path: str, *, prompt_key: str, max_prompts: int) -> list[
             break
         if prompt_key not in record:
             raise ValueError(f"Missing prompt key {prompt_key!r} in record {index}")
-        messages = _prepend_rollout_instruction(_normalize_prompt_messages(record[prompt_key]))
+        messages = _normalize_prompt_messages(record[prompt_key])
+        if add_rollout_instruction:
+            messages = _prepend_rollout_instruction(messages, DEFAULT_ROLLOUT_INSTRUCTION)
         uid = record.get("uid", f"sample_{index:08d}")
         normalized.append(
             {
@@ -294,6 +301,10 @@ def main() -> None:
     parser.add_argument("--teacher-port", type=int, default=0)
     parser.add_argument("--teacher-api-key", default="")
     parser.add_argument("--teacher-timeout-s", type=float, default=300.0)
+    parser.add_argument("--request-timeout-s", type=float, default=60.0)
+    parser.add_argument("--request-max-attempts", type=int, default=3)
+    parser.add_argument("--request-retry-delay-s", type=float, default=2.0)
+    parser.add_argument("--use-sglang-defaults", action="store_true")
     parser.add_argument("--teacher-attention-backend", default="fa3")
     parser.add_argument("--teacher-sampling-backend", default="flashinfer")
     parser.add_argument("--teacher-disable-cuda-graph", action=argparse.BooleanOptionalAction, default=False)
@@ -314,6 +325,7 @@ def main() -> None:
     parser.add_argument("--enable-thinking", action="store_true")
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--disable-tqdm", action="store_true")
+    parser.add_argument("--no-rollout-instruction", action="store_true")
     args = parser.parse_args()
 
     output_path = Path(args.output_jsonl)
@@ -325,7 +337,12 @@ def main() -> None:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    records = _load_records(args.input_data, prompt_key=args.prompt_key, max_prompts=args.max_prompts)
+    records = _load_records(
+        args.input_data,
+        prompt_key=args.prompt_key,
+        max_prompts=args.max_prompts,
+        add_rollout_instruction=not args.no_rollout_instruction,
+    )
     for record in records:
         record["prompt_ids"] = _apply_chat_template(tokenizer, record["messages"], enable_thinking=args.enable_thinking)
 
@@ -333,6 +350,8 @@ def main() -> None:
     server_processes: list[subprocess.Popen] = []
     adapters: list[HttpServerAdapter] = []
     try:
+        from verl.workers.rollout.sglang_rollout.http_server_engine import HttpServerAdapter
+
         if args.parallel_mode == "dp":
             for replica_idx, device_id in enumerate(teacher_devices):
                 teacher_port = _find_free_port()
@@ -342,15 +361,15 @@ def main() -> None:
                     "model_path": args.teacher_model_path,
                     "tensor_parallel_size": 1,
                     "api_key": args.teacher_api_key,
-                    "dtype": args.dtype,
+                    "dtype": None if args.use_sglang_defaults else args.dtype,
                     "trust_remote_code": args.trust_remote_code,
                     "log_level": "error",
-                    "attention_backend": args.teacher_attention_backend,
-                    "sampling_backend": args.teacher_sampling_backend,
+                    "attention_backend": None if args.use_sglang_defaults else args.teacher_attention_backend,
+                    "sampling_backend": None if args.use_sglang_defaults else args.teacher_sampling_backend,
                     "disable_cuda_graph": args.teacher_disable_cuda_graph,
-                    "mem_fraction_static": args.teacher_mem_fraction_static,
-                    "chunked_prefill_size": args.teacher_chunked_prefill_size,
-                    "max_total_tokens": args.teacher_max_total_tokens,
+                    "mem_fraction_static": None if args.use_sglang_defaults else args.teacher_mem_fraction_static,
+                    "chunked_prefill_size": None if args.use_sglang_defaults else args.teacher_chunked_prefill_size,
+                    "max_total_tokens": None if args.use_sglang_defaults else args.teacher_max_total_tokens,
                 }
                 teacher_log_path = output_path.parent / f"teacher_sglang_dp_{replica_idx}.log"
                 server_process = _launch_teacher_server(
@@ -368,6 +387,9 @@ def main() -> None:
                 server_processes.append(server_process)
                 adapters.append(
                     HttpServerAdapter(
+                        timeout=args.request_timeout_s,
+                        max_attempts=args.request_max_attempts,
+                        retry_delay=args.request_retry_delay_s,
                         host=args.teacher_host,
                         port=teacher_port,
                         node_rank=0,
@@ -387,15 +409,15 @@ def main() -> None:
                 "model_path": args.teacher_model_path,
                 "tensor_parallel_size": teacher_tp_size,
                 "api_key": args.teacher_api_key,
-                "dtype": args.dtype,
+                "dtype": None if args.use_sglang_defaults else args.dtype,
                 "trust_remote_code": args.trust_remote_code,
                 "log_level": "error",
-                "attention_backend": args.teacher_attention_backend,
-                "sampling_backend": args.teacher_sampling_backend,
+                "attention_backend": None if args.use_sglang_defaults else args.teacher_attention_backend,
+                "sampling_backend": None if args.use_sglang_defaults else args.teacher_sampling_backend,
                 "disable_cuda_graph": args.teacher_disable_cuda_graph,
-                "mem_fraction_static": args.teacher_mem_fraction_static,
-                "chunked_prefill_size": args.teacher_chunked_prefill_size,
-                "max_total_tokens": args.teacher_max_total_tokens,
+                "mem_fraction_static": None if args.use_sglang_defaults else args.teacher_mem_fraction_static,
+                "chunked_prefill_size": None if args.use_sglang_defaults else args.teacher_chunked_prefill_size,
+                "max_total_tokens": None if args.use_sglang_defaults else args.teacher_max_total_tokens,
             }
             teacher_log_path = output_path.parent / "teacher_sglang.log"
             server_process = _launch_teacher_server(
@@ -413,6 +435,9 @@ def main() -> None:
             server_processes.append(server_process)
             adapters.append(
                 HttpServerAdapter(
+                    timeout=args.request_timeout_s,
+                    max_attempts=args.request_max_attempts,
+                    retry_delay=args.request_retry_delay_s,
                     host=args.teacher_host,
                     port=teacher_port,
                     node_rank=0,

@@ -13,6 +13,7 @@ from omegaconf import OmegaConf
 from verl import DataProto
 from recipe.waste_sd.collect_offline_rollout import (
     DEFAULT_ROLLOUT_INSTRUCTION,
+    _load_records,
     _prepend_rollout_instruction,
     _normalize_prompt_messages,
     _prompt_text_for_storage,
@@ -598,6 +599,27 @@ class TestCollectOfflineRolloutHelpers(unittest.TestCase):
         prompt_text = _prompt_text_for_storage(messages)
 
         self.assertEqual(prompt_text, "Question 1\n\nQuestion 2")
+
+    def test_load_records_respects_rollout_instruction_flag(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "data.jsonl"
+            input_path.write_text(json.dumps({"prompt": "What is 2 + 2?"}, ensure_ascii=True) + "\n", encoding="utf-8")
+
+            with_instruction = _load_records(
+                str(input_path),
+                prompt_key="prompt",
+                max_prompts=-1,
+                add_rollout_instruction=True,
+            )
+            without_instruction = _load_records(
+                str(input_path),
+                prompt_key="prompt",
+                max_prompts=-1,
+                add_rollout_instruction=False,
+            )
+
+            self.assertIn(DEFAULT_ROLLOUT_INSTRUCTION, with_instruction[0]["messages"][0]["content"])
+            self.assertNotIn(DEFAULT_ROLLOUT_INSTRUCTION, without_instruction[0]["messages"][0]["content"])
 
 
 class TestOfflineTeacherRolloutTrainerHelpers(unittest.TestCase):

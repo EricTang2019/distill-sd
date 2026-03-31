@@ -64,10 +64,10 @@ def validate_distill_objective_config(
             "so waste/remaining-budget weighting modes do not apply on top. "
             f"Got weighting_mode={weighting_mode!r}."
         )
-    if weighting_mode == "remaining_budget_forward" and loss_type != "fkl":
+    if weighting_mode == "remaining_budget_forward" and loss_type not in {"fkl", "tvd"}:
         raise ValueError(
             "distill.weighting_mode='remaining_budget_forward' currently requires "
-            "distill.loss_type='fkl' to match the forward-KL objective in expectation.tex. "
+            "distill.loss_type in {'fkl', 'tvd'}. "
             f"Got loss_type={loss_type!r}."
         )
     if not (0.0 <= kl_floor_coef <= 1.0):
@@ -78,11 +78,12 @@ def validate_distill_objective_config(
             f"got {rembudget_unweighted_kl_coef}."
         )
     if rembudget_unweighted_kl_coef > 0.0 and not (
-        weighting_mode == "remaining_budget_forward" and loss_type == "fkl"
+        weighting_mode == "remaining_budget_forward" and loss_type in {"fkl", "tvd"}
     ):
         raise ValueError(
             "distill.rembudget_unweighted_kl_coef only applies to "
-            "distill.weighting_mode='remaining_budget_forward' with distill.loss_type='fkl'. "
+            "distill.weighting_mode='remaining_budget_forward' with "
+            "distill.loss_type in {'fkl', 'tvd'}. "
             f"Got weighting_mode={weighting_mode!r}, loss_type={loss_type!r}."
         )
     if not (0.0 <= exact_unweighted_kl_coef <= 1.0):
@@ -637,22 +638,32 @@ class DataParallelWasteSDDistillActor(DataParallelPPOActor):
                             responses=model_inputs["responses"],
                             response_mask=response_mask,
                         )
-                        if self.weighting_mode == "remaining_budget_forward" and self.loss_type == "fkl" and self.rembudget_unweighted_kl_coef > 0.0:
-                            # Reuse a single dense FKL token-divergence graph, then reduce it two
-                            # ways: remaining-budget weighted and plain unweighted. Calling the FKL
-                            # loss twice on the same FSDP-backed logits graph can trigger fragile
-                            # backward/view behavior, so keep this branch single-pass.
-                            student_logp = torch.log_softmax(student_logits.float(), dim=-1)
-                            teacher_logp = torch.log_softmax(teacher_logits.float(), dim=-1)
-                            teacher_prob = torch.exp(teacher_logp)
-                            token_div = torch.sum(
-                                torch.where(
-                                    teacher_prob > 0,
-                                    teacher_prob * (teacher_logp - student_logp),
-                                    teacher_logp.new_zeros(()),
-                                ),
-                                dim=-1,
-                            )
+                        if (
+                            self.weighting_mode == "remaining_budget_forward"
+                            and self.loss_type in {"fkl", "tvd"}
+                            and self.rembudget_unweighted_kl_coef > 0.0
+                        ):
+                            # Reuse a single dense token-divergence graph, then reduce it two
+                            # ways: remaining-budget weighted and plain unweighted. Calling the
+                            # same dense loss twice on the same FSDP-backed logits graph can
+                            # trigger fragile backward/view behavior, so keep this branch
+                            # single-pass.
+                            if self.loss_type == "fkl":
+                                student_logp = torch.log_softmax(student_logits.float(), dim=-1)
+                                teacher_logp = torch.log_softmax(teacher_logits.float(), dim=-1)
+                                teacher_prob = torch.exp(teacher_logp)
+                                token_div = torch.sum(
+                                    torch.where(
+                                        teacher_prob > 0,
+                                        teacher_prob * (teacher_logp - student_logp),
+                                        teacher_logp.new_zeros(()),
+                                    ),
+                                    dim=-1,
+                                )
+                            else:
+                                student_prob = torch.softmax(student_logits.float(), dim=-1)
+                                teacher_prob = torch.softmax(teacher_logits.float(), dim=-1)
+                                token_div = 0.5 * torch.sum(torch.abs(student_prob - teacher_prob), dim=-1)
                             flat_mask = response_mask.reshape(-1)
                             token_div_flat = token_div.reshape(-1)[flat_mask]
                             weight_flat = token_weights.reshape(-1)[flat_mask].to(dtype=torch.float32)
@@ -660,37 +671,38 @@ class DataParallelWasteSDDistillActor(DataParallelPPOActor):
                                 micro_weighted_sum = student_logits.new_zeros((), dtype=torch.float32)
                                 micro_weight_sum = student_logits.new_zeros((), dtype=torch.float32)
                                 micro_weighted_mean = micro_weighted_sum
-                                unweighted_fkl_loss = micro_weighted_sum
+                                unweighted_loss = micro_weighted_sum
                                 loss_metrics = {
-                                    "distill/fkl_token_div_mean": 0.0,
-                                    "distill/fkl_token_div_max": 0.0,
+                                    f"distill/{self.loss_type}_token_div_mean": 0.0,
+                                    f"distill/{self.loss_type}_token_div_max": 0.0,
                                     "distill/token_count": 0.0,
                                 }
                             else:
                                 micro_weighted_sum = torch.sum(token_div_flat * weight_flat)
                                 micro_weight_sum = torch.sum(weight_flat)
                                 micro_weighted_mean = self._weighted_token_mean(micro_weighted_sum, micro_weight_sum)
-                                unweighted_fkl_loss = token_div_flat.mean()
+                                unweighted_loss = token_div_flat.mean()
                                 loss_metrics = {
-                                    "distill/fkl_token_div_mean": token_div_flat.mean().item(),
-                                    "distill/fkl_token_div_max": token_div_flat.max().item(),
+                                    f"distill/{self.loss_type}_token_div_mean": token_div_flat.mean().item(),
+                                    f"distill/{self.loss_type}_token_div_max": token_div_flat.max().item(),
                                     "distill/token_count": float(token_div_flat.numel()),
                                 }
                             append_to_dict(sample_level_metrics, loss_metrics)
                             micro_metrics["distill/weighted_divergence_mean"] = micro_weighted_mean.detach().item()
                             micro_metrics[f"distill/weighted_{self.loss_type}_mean"] = micro_weighted_mean.detach().item()
                             micro_metrics["distill/micro_weight_sum"] = micro_weight_sum.detach().item()
-                            micro_metrics["distill/weighted_kl_mean"] = micro_weighted_mean.detach().item()
+                            if self.loss_type == "fkl":
+                                micro_metrics["distill/weighted_kl_mean"] = micro_weighted_mean.detach().item()
                             micro_metrics.update(self._reduce_sample_metrics(sample_level_metrics))
                             mix_coef = self.rembudget_unweighted_kl_coef
-                            micro_metrics["distill/unweighted_fkl_mean"] = unweighted_fkl_loss.detach().item()
-                            micro_metrics["distill/mixed_rembudget_unweighted_fkl_mean"] = (
+                            micro_metrics[f"distill/unweighted_{self.loss_type}_mean"] = unweighted_loss.detach().item()
+                            micro_metrics[f"distill/mixed_rembudget_unweighted_{self.loss_type}_mean"] = (
                                 (1.0 - mix_coef) * micro_weighted_mean.detach().item()
-                                + mix_coef * unweighted_fkl_loss.detach().item()
+                                + mix_coef * unweighted_loss.detach().item()
                             )
                             micro_metrics["distill/student_nll_all_response_tokens_mean"] = all_token_nll_mean
                             micro_metrics["distill/student_nll_all_response_tokens_max"] = all_token_nll_max
-                            micro_objective = (1.0 - mix_coef) * micro_weighted_mean + mix_coef * unweighted_fkl_loss
+                            micro_objective = (1.0 - mix_coef) * micro_weighted_mean + mix_coef * unweighted_loss
                             micro_metrics["actor/distill_loss"] = micro_objective.detach().item()
                         else:
                             _, micro_weighted_sum, micro_weight_sum, loss_metrics = self.loss_fn(

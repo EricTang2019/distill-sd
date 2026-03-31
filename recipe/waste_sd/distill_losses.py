@@ -137,8 +137,13 @@ def compute_dense_distill_loss_batched(
             "distill/token_count": 0.0,
         }
 
-    student_logp = torch.log_softmax(student_logits, dim=-1)
-    teacher_logp = teacher_tensor if teacher_is_log_probs else torch.log_softmax(teacher_tensor, dim=-1)
+    if loss_type == "tvd":
+        student_prob = torch.softmax(student_logits, dim=-1)
+        teacher_prob = torch.exp(teacher_tensor) if teacher_is_log_probs else torch.softmax(teacher_tensor, dim=-1)
+        token_div = 0.5 * torch.sum(torch.abs(student_prob - teacher_prob), dim=-1)
+    else:
+        student_logp = torch.log_softmax(student_logits, dim=-1)
+        teacher_logp = teacher_tensor if teacher_is_log_probs else torch.log_softmax(teacher_tensor, dim=-1)
 
     if loss_type == "fkl":
         teacher_prob = torch.exp(teacher_logp)
@@ -151,9 +156,7 @@ def compute_dense_distill_loss_batched(
         student_prob = torch.exp(student_logp)
         token_div = torch.sum(student_prob * (student_logp - teacher_logp), dim=-1)
     elif loss_type == "tvd":
-        student_prob = torch.exp(student_logp)
-        teacher_prob = torch.exp(teacher_logp)
-        token_div = 0.5 * torch.sum(torch.abs(student_prob - teacher_prob), dim=-1)
+        pass
     else:
         raise ValueError(f"Unsupported loss_type {loss_type}")
 

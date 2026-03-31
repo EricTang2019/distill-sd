@@ -38,6 +38,9 @@ from verl.utils.rollout_skip import RolloutSkip
 class WasteSDRayTrainer(RayPPOTrainer):
     """Strict waste-aware SD distillation trainer (SGLang rollout, FSDP actor update)."""
     _LOCAL_VERSION_KEY = "waste_sd_weight_version"
+    _CHECKPOINT_CONTENTS_METADATA_FILENAME = "checkpoint_contents.json"
+    _FULL_CHECKPOINT_CONTENTS = ["model", "optimizer", "extra"]
+    _MODEL_ONLY_CHECKPOINT_CONTENTS = ["model"]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -76,6 +79,83 @@ class WasteSDRayTrainer(RayPPOTrainer):
 
     def _use_offline_teacher_rollout_data(self) -> bool:
         return self.data_mode == "offline_teacher_rollout"
+
+    def _resolve_checkpoint_root_dir(self) -> str:
+        checkpoint_root = self.config.trainer.default_local_dir
+        if not os.path.isabs(checkpoint_root):
+            checkpoint_root = os.path.join(os.getcwd(), checkpoint_root)
+        return checkpoint_root
+
+    @classmethod
+    def _normalize_checkpoint_contents(cls, contents: list[str]) -> list[str]:
+        normalized = []
+        for item in contents:
+            value = str(item)
+            if value not in normalized:
+                normalized.append(value)
+        if "model" not in normalized:
+            raise ValueError(f"checkpoint contents must include 'model', got {normalized}")
+        return normalized
+
+    def _actor_checkpoint_local_path(self, global_step: int) -> str:
+        return os.path.join(self._resolve_checkpoint_root_dir(), f"global_step_{int(global_step)}", "actor")
+
+    @classmethod
+    def _checkpoint_contents_metadata_path(cls, actor_local_path: str) -> str:
+        return os.path.join(actor_local_path, cls._CHECKPOINT_CONTENTS_METADATA_FILENAME)
+
+    @classmethod
+    def _write_actor_checkpoint_metadata(cls, actor_local_path: str, contents: list[str]) -> None:
+        if not os.path.isdir(actor_local_path):
+            return
+        normalized = cls._normalize_checkpoint_contents(contents)
+        metadata = {
+            "version": 1,
+            "save_contents": normalized,
+            "load_contents": normalized,
+        }
+        metadata_path = cls._checkpoint_contents_metadata_path(actor_local_path)
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, ensure_ascii=True, indent=2, sort_keys=True)
+
+    @classmethod
+    def _prune_actor_checkpoint_non_model_state(cls, actor_local_path: str) -> None:
+        if not os.path.isdir(actor_local_path):
+            return
+        for filename in os.listdir(actor_local_path):
+            if filename.startswith(("optim_world_size_", "extra_state_world_size_")) and filename.endswith(".pt"):
+                os.remove(os.path.join(actor_local_path, filename))
+        cls._write_actor_checkpoint_metadata(actor_local_path, cls._MODEL_ONLY_CHECKPOINT_CONTENTS)
+
+    def _iter_actor_checkpoint_steps(self) -> list[int]:
+        checkpoint_root = self._resolve_checkpoint_root_dir()
+        if not os.path.isdir(checkpoint_root):
+            return []
+        steps = []
+        for entry in os.listdir(checkpoint_root):
+            if not entry.startswith("global_step_"):
+                continue
+            try:
+                global_step = int(entry.split("global_step_", 1)[1])
+            except ValueError:
+                continue
+            actor_local_path = os.path.join(checkpoint_root, entry, "actor")
+            if os.path.isdir(actor_local_path):
+                steps.append(global_step)
+        return sorted(steps)
+
+    def _finalize_actor_checkpoint_storage_policy(self, latest_step: int) -> None:
+        latest_actor_local_path = self._actor_checkpoint_local_path(latest_step)
+        self._write_actor_checkpoint_metadata(latest_actor_local_path, self._FULL_CHECKPOINT_CONTENTS)
+
+        for global_step in self._iter_actor_checkpoint_steps():
+            if global_step == int(latest_step):
+                continue
+            self._prune_actor_checkpoint_non_model_state(self._actor_checkpoint_local_path(global_step))
+
+    def _save_checkpoint(self):
+        super()._save_checkpoint()
+        self._finalize_actor_checkpoint_storage_policy(latest_step=self.global_steps)
 
     def _extract_prompt_response_ids(self, batch: DataProto) -> tuple[list[list[int]], list[list[int]]]:
         prompts = batch.batch["prompts"].detach().cpu()

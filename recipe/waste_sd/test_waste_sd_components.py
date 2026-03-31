@@ -319,7 +319,7 @@ class TestDistillObjectiveValidation(unittest.TestCase):
             exact_unweighted_kl_coef=0.2,
         )
 
-    def test_rembudget_unweighted_kl_coef_requires_forward_fkl(self):
+    def test_rembudget_unweighted_kl_coef_requires_remaining_budget_mode(self):
         with self.assertRaisesRegex(ValueError, "only applies to"):
             validate_distill_objective_config(
                 loss_type="fkl",
@@ -329,9 +329,27 @@ class TestDistillObjectiveValidation(unittest.TestCase):
                 exact_unweighted_kl_coef=0.0,
             )
 
+    def test_rembudget_forward_accepts_tvd(self):
+        validate_distill_objective_config(
+            loss_type="tvd",
+            weighting_mode="remaining_budget_forward",
+            kl_floor_coef=0.0,
+            rembudget_unweighted_kl_coef=0.0,
+            exact_unweighted_kl_coef=0.0,
+        )
+
     def test_rembudget_unweighted_kl_coef_accepts_forward_fkl(self):
         validate_distill_objective_config(
             loss_type="fkl",
+            weighting_mode="remaining_budget_forward",
+            kl_floor_coef=0.0,
+            rembudget_unweighted_kl_coef=0.2,
+            exact_unweighted_kl_coef=0.0,
+        )
+
+    def test_rembudget_unweighted_kl_coef_accepts_forward_tvd(self):
+        validate_distill_objective_config(
+            loss_type="tvd",
             weighting_mode="remaining_budget_forward",
             kl_floor_coef=0.0,
             rembudget_unweighted_kl_coef=0.2,
@@ -623,6 +641,38 @@ class TestCollectOfflineRolloutHelpers(unittest.TestCase):
 
 
 class TestOfflineTeacherRolloutTrainerHelpers(unittest.TestCase):
+    def test_finalize_actor_checkpoint_storage_policy_keeps_latest_full(self):
+        trainer = WasteSDRayTrainer.__new__(WasteSDRayTrainer)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trainer.config = OmegaConf.create({"trainer": {"default_local_dir": tmpdir}})
+            older_actor_dir = Path(tmpdir) / "global_step_600" / "actor"
+            latest_actor_dir = Path(tmpdir) / "global_step_1200" / "actor"
+            older_actor_dir.mkdir(parents=True)
+            latest_actor_dir.mkdir(parents=True)
+
+            for actor_dir in (older_actor_dir, latest_actor_dir):
+                (actor_dir / "model_world_size_4_rank_0.pt").write_text("model", encoding="utf-8")
+                (actor_dir / "optim_world_size_4_rank_0.pt").write_text("optim", encoding="utf-8")
+                (actor_dir / "extra_state_world_size_4_rank_0.pt").write_text("extra", encoding="utf-8")
+
+            trainer._finalize_actor_checkpoint_storage_policy(latest_step=1200)
+
+            self.assertTrue((older_actor_dir / "model_world_size_4_rank_0.pt").exists())
+            self.assertFalse((older_actor_dir / "optim_world_size_4_rank_0.pt").exists())
+            self.assertFalse((older_actor_dir / "extra_state_world_size_4_rank_0.pt").exists())
+
+            self.assertTrue((latest_actor_dir / "model_world_size_4_rank_0.pt").exists())
+            self.assertTrue((latest_actor_dir / "optim_world_size_4_rank_0.pt").exists())
+            self.assertTrue((latest_actor_dir / "extra_state_world_size_4_rank_0.pt").exists())
+
+            older_metadata = json.loads((older_actor_dir / "checkpoint_contents.json").read_text(encoding="utf-8"))
+            latest_metadata = json.loads((latest_actor_dir / "checkpoint_contents.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(older_metadata["load_contents"], ["model"])
+            self.assertEqual(older_metadata["save_contents"], ["model"])
+            self.assertEqual(latest_metadata["load_contents"], ["model", "optimizer", "extra"])
+            self.assertEqual(latest_metadata["save_contents"], ["model", "optimizer", "extra"])
+
     def test_prepare_offline_teacher_rollout_batch_and_extract_ids(self):
         trainer = WasteSDRayTrainer.__new__(WasteSDRayTrainer)
         trainer.data_mode = "offline_teacher_rollout"
@@ -740,6 +790,51 @@ class TestOfflineTeacherRolloutTrainerHelpers(unittest.TestCase):
 
 
 class TestOfflineTeacherRolloutWorker(unittest.TestCase):
+    def test_load_checkpoint_uses_metadata_to_switch_to_model_only(self):
+        worker = WasteSDAsyncActorRolloutRefWorker.__new__(WasteSDAsyncActorRolloutRefWorker)
+        worker._is_actor = True
+        worker._is_rollout = False
+        worker._is_offload_param = False
+        worker._is_offload_optimizer = False
+        worker.checkpoint_manager = mock.Mock()
+        worker.checkpoint_manager.checkpoint_load_contents = ["model", "optimizer", "extra"]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            actor_dir = Path(tmpdir) / "actor"
+            actor_dir.mkdir()
+            (actor_dir / "checkpoint_contents.json").write_text(
+                json.dumps({"load_contents": ["model"]}, ensure_ascii=True),
+                encoding="utf-8",
+            )
+
+            WasteSDAsyncActorRolloutRefWorker.load_checkpoint(worker, str(actor_dir))
+
+        self.assertEqual(worker.checkpoint_manager.checkpoint_load_contents, ["model"])
+        worker.checkpoint_manager.load_checkpoint.assert_called_once()
+
+    def test_explicit_checkpoint_load_override_wins_over_metadata(self):
+        worker = WasteSDAsyncActorRolloutRefWorker.__new__(WasteSDAsyncActorRolloutRefWorker)
+        worker._is_actor = True
+        worker._is_rollout = False
+        worker._is_offload_param = False
+        worker._is_offload_optimizer = False
+        worker.checkpoint_manager = mock.Mock()
+        worker.checkpoint_manager.checkpoint_load_contents = ["model", "optimizer", "extra"]
+
+        WasteSDAsyncActorRolloutRefWorker.set_checkpoint_load_contents(worker, ["model"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            actor_dir = Path(tmpdir) / "actor"
+            actor_dir.mkdir()
+            (actor_dir / "checkpoint_contents.json").write_text(
+                json.dumps({"load_contents": ["model", "optimizer", "extra"]}, ensure_ascii=True),
+                encoding="utf-8",
+            )
+
+            WasteSDAsyncActorRolloutRefWorker.load_checkpoint(worker, str(actor_dir))
+
+        self.assertEqual(worker.checkpoint_manager.checkpoint_load_contents, ["model"])
+
     def test_offline_mode_disables_rollout_engine_before_super_init(self):
         worker = WasteSDAsyncActorRolloutRefWorker.__new__(WasteSDAsyncActorRolloutRefWorker)
         worker.config = OmegaConf.create(

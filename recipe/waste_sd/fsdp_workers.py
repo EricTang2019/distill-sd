@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import json
 import logging
 import os
 import warnings
@@ -47,11 +48,53 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 class WasteSDAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
     """FSDP actor+rollout worker with strict waste-aware distillation update path."""
+    _CHECKPOINT_CONTENTS_METADATA_FILENAME = "checkpoint_contents.json"
 
     def _use_offline_teacher_rollout_data(self) -> bool:
         distill_cfg = self.config.get("distill", {})
         data_mode = str(distill_cfg.get("data_mode", "online_rollout")).lower()
         return data_mode == "offline_teacher_rollout"
+
+    def _normalize_checkpoint_load_contents(self, load_contents: list[str]) -> list[str]:
+        normalized = []
+        for item in load_contents:
+            value = str(item)
+            if value not in normalized:
+                normalized.append(value)
+        if "model" not in normalized:
+            raise ValueError(
+                "checkpoint load contents must include 'model', "
+                f"got {normalized}"
+            )
+        return normalized
+
+    def _metadata_checkpoint_load_contents(self, local_path: str) -> list[str] | None:
+        metadata_path = os.path.join(local_path, self._CHECKPOINT_CONTENTS_METADATA_FILENAME)
+        if not os.path.isfile(metadata_path):
+            return None
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+        contents = metadata.get("load_contents", metadata.get("save_contents"))
+        if not isinstance(contents, list):
+            raise ValueError(
+                f"Malformed checkpoint contents metadata at {metadata_path}: "
+                f"expected list-valued load_contents/save_contents, got {contents!r}"
+            )
+        return self._normalize_checkpoint_load_contents(contents)
+
+    def _maybe_apply_checkpoint_load_contents_from_metadata(self, local_path: str) -> None:
+        if (
+            local_path is None
+            or not hasattr(self, "checkpoint_manager")
+            or self.checkpoint_manager is None
+            or getattr(self, "_checkpoint_load_contents_override", False)
+        ):
+            return
+        metadata_contents = self._metadata_checkpoint_load_contents(local_path)
+        if metadata_contents is None:
+            return
+        self.checkpoint_manager.checkpoint_load_contents = metadata_contents
+        logger.warning("Override checkpoint load_contents from %s to %s", local_path, metadata_contents)
 
     def _resolve_teacher_forward_backend(self) -> str:
         distill_cfg = self.config.get("distill", {})
@@ -311,14 +354,39 @@ class WasteSDAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
         """
         if not hasattr(self, "checkpoint_manager") or self.checkpoint_manager is None:
             return
-        normalized = [str(x) for x in load_contents]
-        if "model" not in normalized:
-            raise ValueError(
-                "checkpoint load contents must include 'model', "
-                f"got {normalized}"
-            )
+        normalized = self._normalize_checkpoint_load_contents(load_contents)
+        self._checkpoint_load_contents_override = True
         self.checkpoint_manager.checkpoint_load_contents = normalized
         logger.warning("Override checkpoint load_contents to %s", normalized)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
+        assert self._is_actor or (not self._is_actor and self._is_rollout), (
+            f"Checkpoint loading is only supported for Actor or standalone Rollout Workers, but got "
+            f"{self._is_actor} and {self._is_rollout}"
+        )
+
+        if local_path is None:
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            if self._is_offload_optimizer:
+                offload_fsdp_optimizer(self.actor_optimizer)
+            return
+
+        self._maybe_apply_checkpoint_load_contents_from_metadata(local_path)
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        self.checkpoint_manager.load_checkpoint(
+            local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
+        )
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(self.actor_optimizer)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_distill_update")

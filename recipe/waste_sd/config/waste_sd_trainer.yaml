@@ -39,9 +39,9 @@ distill:
   weighting_mode: waste # waste | uniform_mean | remaining_budget_forward
   # Optional KL floor coefficient for forward-only remaining-budget weighted soft distillation.
   kl_floor_coef: 0.0
-  # Optional convex mixing coefficient for forward-only remaining-budget weighted FKL.
-  # Only used when weighting_mode=remaining_budget_forward and loss_type=fkl.
-  #   loss = (1 - rembudget_unweighted_kl_coef) * rembudget_FKL + rembudget_unweighted_kl_coef * unweighted_FKL
+  # Optional convex mixing coefficient for forward-only remaining-budget weighted dense loss.
+  # Only used when weighting_mode=remaining_budget_forward and loss_type in {fkl, tvd}.
+  #   loss = (1 - rembudget_unweighted_kl_coef) * rembudget_loss + rembudget_unweighted_kl_coef * unweighted_loss
   rembudget_unweighted_kl_coef: 0.0
   # Optional convex mixing coefficient for exact omega + unweighted forward-KL.
   # Only used when loss_type=exact_block_count_wnll.

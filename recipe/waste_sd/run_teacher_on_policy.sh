@@ -138,7 +138,7 @@ WASTE_SD_TEACHER_MODEL="${WASTE_SD_TEACHER_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
 WASTE_SD_DATA_ROOT="${WASTE_SD_DATA_ROOT:-${REPO_ROOT}/data/verl_fsdp_smoke}"
 WASTE_SD_TRAIN_FILE="${WASTE_SD_TRAIN_FILE:-${WASTE_SD_DATA_ROOT}/train.json}"
 WASTE_SD_VAL_FILE="${WASTE_SD_VAL_FILE:-${WASTE_SD_DATA_ROOT}/val.json}"
-WASTE_SD_TOTAL_TRAINING_STEPS="${WASTE_SD_TOTAL_TRAINING_STEPS:-3}"
+WASTE_SD_TOTAL_TRAINING_STEPS="${WASTE_SD_TOTAL_TRAINING_STEPS-3}"
 WASTE_SD_TOTAL_EPOCHS="${WASTE_SD_TOTAL_EPOCHS:-}"
 WASTE_SD_TEMPERATURE="${WASTE_SD_TEMPERATURE:-1.0}"
 WASTE_SD_GAMMA="${WASTE_SD_GAMMA:-1}"
@@ -204,6 +204,15 @@ fi
 if [[ -n "${WASTE_SD_VALIDATION_DATA_DIR}" ]]; then
   TRAINER_EXTRA_OVERRIDES+=("trainer.validation_data_dir=${WASTE_SD_VALIDATION_DATA_DIR}")
 fi
+
+TRAINER_STEP_OVERRIDES=()
+case "${WASTE_SD_TOTAL_TRAINING_STEPS}" in
+  ""|none|None|null|NULL)
+    ;;
+  *)
+    TRAINER_STEP_OVERRIDES+=("trainer.total_training_steps=${WASTE_SD_TOTAL_TRAINING_STEPS}")
+    ;;
+esac
 
 BLOCK_EVAL_OVERRIDES=(
   "+trainer.block_eval_only=${WASTE_SD_BLOCK_EVAL_ONLY}"
@@ -271,7 +280,7 @@ fi
   distill.rollout_target=actor \
   data.train_files="${WASTE_SD_TRAIN_FILE}" \
   data.val_files="${WASTE_SD_VAL_FILE}" \
-  trainer.total_training_steps="${WASTE_SD_TOTAL_TRAINING_STEPS}" \
+  "${TRAINER_STEP_OVERRIDES[@]}" \
   trainer.n_gpus_per_node="${WASTE_SD_N_GPUS_PER_NODE}" \
   trainer.nnodes="${WASTE_SD_NNODES}" \
   trainer.save_freq="${WASTE_SD_SAVE_FREQ}" \

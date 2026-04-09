@@ -19,6 +19,14 @@ algorithm:
 
 trainer:
   val_before_train: false
+  exact_blocks_eval_freq: -1
+  exact_blocks_eval_data_file: null
+  exact_blocks_eval_batch_size: 64
+  exact_blocks_eval_max_samples: -1
+  exact_blocks_eval_max_prompt_length: 1024
+  exact_blocks_eval_max_response_length: 2048
+  exact_blocks_eval_truncation: right
+  exact_blocks_eval_temperature: 1.0
 
 actor_rollout_ref:
   actor:
@@ -39,14 +47,65 @@ distill:
   weighting_mode: waste # waste | uniform_mean | remaining_budget_forward
   # Optional KL floor coefficient for forward-only remaining-budget weighted soft distillation.
   kl_floor_coef: 0.0
+  # Objective mode for remaining-budget TVD.
+  # weighted_mean keeps the existing detached weighted token-mean objective.
+  # theorem_unnormalized switches to the strict theorem form
+  #   mean_i[T_i/(gamma+1) + gamma/(gamma+1) * sum_n w_{i,n}^rem * TVD_{i,n}]
+  # with full autodiff through w^rem.
+  rembudget_tvd_objective_mode: weighted_mean # weighted_mean | theorem_unnormalized
+  # Optional backward-only length normalization for theorem_unnormalized:
+  # divide the mini-batch theorem objective by the batch average valid response length,
+  # i.e. optimize sum_i theorem_i / sum_i T_i instead of sum_i theorem_i / B.
+  rembudget_tvd_backward_length_normalize: false
   # Optional convex mixing coefficient for forward-only remaining-budget weighted dense loss.
   # Only used when weighting_mode=remaining_budget_forward and loss_type in {fkl, tvd}.
   #   loss = (1 - rembudget_unweighted_kl_coef) * rembudget_loss + rembudget_unweighted_kl_coef * unweighted_loss
   rembudget_unweighted_kl_coef: 0.0
-  # Optional convex mixing coefficient for exact omega + unweighted forward-KL.
+  rembudget_unweighted_kl_coef_schedule: constant # constant | linear
+  rembudget_unweighted_kl_coef_start: ${distill.rembudget_unweighted_kl_coef}
+  rembudget_unweighted_kl_coef_end: ${distill.rembudget_unweighted_kl_coef}
+  rembudget_unweighted_kl_coef_start_step: 0
+  rembudget_unweighted_kl_coef_end_step: 0
+  # Optional convex mixing coefficient for forward-only remaining-budget TVD + unweighted FKL.
+  # Only used when weighting_mode=remaining_budget_forward and loss_type=tvd.
+  #   loss = (1 - rembudget_tvd_unweighted_fkl_coef) * rembudget_tvd
+  #        + rembudget_tvd_unweighted_fkl_coef * unweighted_fkl
+  rembudget_tvd_unweighted_fkl_coef: 0.0
+  rembudget_tvd_unweighted_fkl_coef_schedule: constant # constant | linear
+  rembudget_tvd_unweighted_fkl_coef_start: ${distill.rembudget_tvd_unweighted_fkl_coef}
+  rembudget_tvd_unweighted_fkl_coef_end: ${distill.rembudget_tvd_unweighted_fkl_coef}
+  rembudget_tvd_unweighted_fkl_coef_start_step: 0
+  rembudget_tvd_unweighted_fkl_coef_end_step: 0
+  # Optional mild remaining-budget bias on top of uniform-mean TVD.
+  # Only used when weighting_mode=uniform_mean and loss_type=tvd.
+  #   loss = mean_n[ a_n * TVD_n ]
+  # where a_n is a detached, centered, one-sided boost.
+  # score_type=rembudget uses softened rembudget weights; score_type=rembudget_tvd
+  # uses detached rembudget * detached token-TVD, and ignores power/eps.
+  tvd_rembudget_bias_score_type: rembudget # rembudget | rembudget_tvd
+  tvd_rembudget_bias_coef: 0.0
+  tvd_rembudget_bias_power: 1.0
+  tvd_rembudget_bias_eps: 1e-3
+  tvd_rembudget_bias_clip: 0.5
+  tvd_rembudget_bias_start_step: 0
+  # Optional current-batch theorem-style RB-TVD diagnostic:
+  #   T/(gamma+1) + (gamma/(gamma+1)) * sum_n w_n^rem * TVD_n
+  # Logged only as a metric; does not affect optimization.
+  log_current_batch_theorem_rb_tvd: false
+  # Optional post-update theorem-style RB-TVD diagnostic on the same mini-batch
+  # immediately after optimizer.step(). Logged only as a metric.
+  # Used for any TVD run so unweighted and rembudget can be compared fairly.
+  log_post_update_batch_theorem_rb_tvd: false
+  # Optional convex mixing coefficient for exact omega + unweighted auxiliary loss.
   # Only used when loss_type=exact_block_count_wnll.
-  #   loss = (1 - exact_unweighted_kl_coef) * exact_wNLL + exact_unweighted_kl_coef * unweighted_FKL
-  exact_unweighted_kl_coef: 0.0
+  #   loss = (1 - exact_unweighted_aux_coef) * exact_wNLL + exact_unweighted_aux_coef * unweighted_aux
+  exact_unweighted_aux_loss_type: fkl # fkl | tvd
+  exact_unweighted_aux_coef: 0.0
+  exact_unweighted_aux_coef_schedule: constant # constant | linear
+  exact_unweighted_aux_coef_start: ${distill.exact_unweighted_aux_coef}
+  exact_unweighted_aux_coef_end: ${distill.exact_unweighted_aux_coef}
+  exact_unweighted_aux_coef_start_step: 0
+  exact_unweighted_aux_coef_end_step: 0
   # teacher forward backend used inside distill update
   # - fsdp_ref: use ref FSDP module directly (default, existing behavior)
   # - local_replica: per-rank local teacher replica, no FSDP collectives on teacher forward

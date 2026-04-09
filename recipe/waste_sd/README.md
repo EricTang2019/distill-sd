@@ -27,10 +27,11 @@ This recipe implements strict waste-aware SD distillation without modifying `sit
     `sum_n w_n * D_n / sum_n w_n`
   - for `exact_block_count_wnll`: alpha-weighted token mean
     `sum_n alpha_n * NLL_n / sum_n alpha_n`
-  - optional for `exact_block_count_wnll`: mix in plain unweighted forward-KL with
-    `distill.exact_unweighted_kl_coef in [0,1]`
+  - optional for `exact_block_count_wnll`: mix in a plain unweighted auxiliary loss with
+    `distill.exact_unweighted_aux_loss_type in {fkl, tvd}` and
+    `distill.exact_unweighted_aux_coef in [0,1]`
     so the optimized objective becomes
-    `(1-c) * exact_wNLL + c * unweighted_FKL`
+    `(1-c) * exact_wNLL + c * unweighted_aux`
   - optional for `weighting_mode=remaining_budget_forward` with `loss_type=fkl`:
     mix in plain unweighted forward-KL with
     `distill.rembudget_unweighted_kl_coef in [0,1]`
@@ -100,11 +101,31 @@ Strict on-policy teacher baseline setup:
 
 ## Reproducibility Notes
 
-- Run from repository root: `On-Policy-Distillation/verl`.
-- Use one of:
-  - project requirements: `pip install -r requirements.txt -r requirements_sglang.txt`
-  - conda env with pinned versions used by your cluster.
-- Runtime patch env vars are injected in both launcher process and Ray runtime env by `main_waste_sd.py`.
+For exact reproduction of this fork, do **not** start from the generic project requirements or the legacy install script.
+
+Use the pinned bootstrap instead:
+
+```bash
+bash scripts/setup/bootstrap_envs.sh
+```
+
+This creates the two officially supported environments for this recipe:
+
+- `distillsd`: training / SGLang
+- `verlsd`: strict evaluation / vLLM
+
+After the bootstrap finishes:
+
+- run training commands with `conda run -n distillsd ...`
+- run strict vLLM eval commands with `conda run -n verlsd ...`
+
+The repository itself is installed into each environment with:
+
+```bash
+python -m pip install --no-deps -e .
+```
+
+The pinned snapshots live under `envs/` and are validated by `scripts/setup/validate_env.py`.
 
 ## Local Component Test
 

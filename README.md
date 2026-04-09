@@ -47,6 +47,38 @@ verl is fast with:
 
 </p>
 
+## This Fork: Exact Environment Quickstart
+
+If you want to reproduce the waste-aware SD training and strict vLLM evaluation code in this fork, use the pinned environment bootstrap below instead of the generic upstream installation docs.
+
+This repo currently supports two exact `linux-aarch64` environments:
+
+- `distillsd`: training / SGLang
+- `verlsd`: strict evaluation / vLLM
+
+Shortest supported setup command:
+
+```bash
+bash scripts/setup/bootstrap_envs.sh
+```
+
+Then sanity-check both environments:
+
+```bash
+conda run -n distillsd python -m recipe.waste_sd.test_waste_sd_components
+conda run -n verlsd python -m recipe.waste_sd.eval_block_counts_vllm --help
+# If you use micromamba or mamba, replace `conda run` with that solver.
+```
+
+Notes:
+
+- The bootstrap script detects `micromamba`, `mamba`, or `conda` automatically, but one of them must already be installed.
+- The exact rebuild also needs network access to the URLs referenced by the lockfiles, including conda-forge and GitHub-hosted artifacts.
+- The exact snapshots live under `envs/`.
+- The repository itself is installed as `python -m pip install --no-deps -e .` after the pinned package snapshots are restored.
+- If you need to rebuild from scratch, rerun with `--recreate`.
+- The legacy `requirements*.txt` files and `scripts/install_vllm_sglang_mcore.sh` are not the recommended path for exact reproduction of this fork.
+
 ## News
 
 - [2026/01] verl has been migrated to the [verl-project](https://github.com/verl-project)

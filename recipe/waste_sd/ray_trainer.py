@@ -17,6 +17,7 @@ import json
 import os
 import uuid
 from pprint import pprint
+from typing import Any
 
 import numpy as np
 import torch
@@ -33,6 +34,28 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer, compute_response_mask
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
+
+
+def normalize_exact_blocks_eval_data_files(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        return [stripped] if stripped else []
+    if isinstance(value, (list, tuple)):
+        files: list[str] = []
+        for item in value:
+            item_str = str(item).strip()
+            if item_str:
+                files.append(item_str)
+        return files
+    raise ValueError(f"trainer.exact_blocks_eval_data_file must be a string or list[str], got {type(value)!r}")
+
+
+def exact_blocks_eval_should_run(*, freq: int, data_files: list[str], global_step: int, is_last_step: bool) -> bool:
+    if freq <= 0 or not data_files:
+        return False
+    return is_last_step or global_step % freq == 0
 
 
 class WasteSDRayTrainer(RayPPOTrainer):
@@ -76,6 +99,35 @@ class WasteSDRayTrainer(RayPPOTrainer):
                 "distill.data_mode must be one of {'online_rollout', 'offline_teacher_rollout'}, "
                 f"got {self.data_mode!r}."
             )
+        self._exact_blocks_eval_data_files = normalize_exact_blocks_eval_data_files(
+            self.config.trainer.get("exact_blocks_eval_data_file", None)
+        )
+        self._exact_blocks_eval_freq = int(self.config.trainer.get("exact_blocks_eval_freq", -1))
+
+    def _maybe_run_exact_blocks_eval(self, *, logger, global_step: int, is_last_step: bool, temperature: float) -> dict[str, float]:
+        if not exact_blocks_eval_should_run(
+            freq=self._exact_blocks_eval_freq,
+            data_files=self._exact_blocks_eval_data_files,
+            global_step=global_step,
+            is_last_step=is_last_step,
+        ):
+            return {}
+
+        eval_request = DataProto(
+            meta_info={
+                "data_files": list(self._exact_blocks_eval_data_files),
+                "batch_size": int(self.config.trainer.get("exact_blocks_eval_batch_size", 64)),
+                "max_samples": int(self.config.trainer.get("exact_blocks_eval_max_samples", -1)),
+                "max_prompt_length": int(self.config.trainer.get("exact_blocks_eval_max_prompt_length", 1024)),
+                "max_response_length": int(self.config.trainer.get("exact_blocks_eval_max_response_length", 2048)),
+                "truncation": str(self.config.trainer.get("exact_blocks_eval_truncation", "right")),
+                "gamma": int(self.config.distill.get("gamma", 8)),
+                "temperature": float(self.config.trainer.get("exact_blocks_eval_temperature", temperature)),
+            }
+        ).to("cpu")
+
+        eval_output = self.actor_rollout_wg.evaluate_exact_blocks_offline(eval_request)
+        return reduce_metrics(eval_output.meta_info["metrics"])
 
     def _use_offline_teacher_rollout_data(self) -> bool:
         return self.data_mode == "offline_teacher_rollout"
@@ -935,6 +987,14 @@ class WasteSDRayTrainer(RayPPOTrainer):
 
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 token_count = int(sum(filtered_batch.meta_info.get("global_token_num", [])))
+                metrics.update(
+                    self._maybe_run_exact_blocks_eval(
+                        logger=logger,
+                        global_step=self.global_steps,
+                        is_last_step=is_last_step,
+                        temperature=float(rollout_cfg.temperature),
+                    )
+                )
                 if token_count > 0:
                     metrics.update(compute_timing_metrics(batch=filtered_batch, timing_raw=timing_raw))
                 else:

@@ -1,0 +1,26 @@
+environment_name: distillsd
+captured_on_utc: '2026-03-31'
+platform: linux-aarch64
+python: 3.12.13
+notes:
+- Exact snapshot of the author working distillsd training environment.
+- The repository itself is installed separately with python -m pip install --no-deps
+  -e .
+packages:
+  torch: 2.9.1+cu128
+  torchvision: 0.24.1
+  torchaudio: 2.9.1
+  numpy: 1.26.4
+  flash_attn: 2.8.3
+  sglang: 0.5.6
+  sgl_kernel: 0.3.18.post2
+  flashinfer: 0.5.3
+  transformers: 4.57.1
+  ray: 2.54.0
+  triton: 3.5.1
+  wandb: 0.25.0
+  liger_kernel: 0.7.0
+absent_packages:
+- vllm
+- xformers
+- bitsandbytes

@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 import warnings
 
 import psutil
@@ -25,6 +26,7 @@ from omegaconf import OmegaConf, open_dict
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoModelForImageTextToText, AutoModelForVision2Seq
 
 from recipe.waste_sd.dp_actor import DataParallelWasteSDDistillActor
+from recipe.waste_sd.eval_exact_blocks_offline import build_offline_eval_batches, evaluate_exact_blocks_with_models
 from verl import DataProto
 from verl.models.transformers.monkey_patch import apply_monkey_patch
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
@@ -49,6 +51,39 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 class WasteSDAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
     """FSDP actor+rollout worker with strict waste-aware distillation update path."""
     _CHECKPOINT_CONTENTS_METADATA_FILENAME = "checkpoint_contents.json"
+
+    def _get_exact_blocks_eval_batches(
+        self,
+        *,
+        data_files: list[str],
+        batch_size: int,
+        max_samples: int,
+        max_prompt_length: int,
+        max_response_length: int,
+        truncation: str,
+    ) -> list[dict[str, torch.Tensor | list[str]]]:
+        cache_key = (
+            tuple(str(path) for path in data_files),
+            int(batch_size),
+            int(max_samples),
+            int(max_prompt_length),
+            int(max_response_length),
+            str(truncation),
+        )
+        if not hasattr(self, "_exact_blocks_eval_batches_cache"):
+            self._exact_blocks_eval_batches_cache = {}
+        cache = self._exact_blocks_eval_batches_cache
+        if cache_key not in cache:
+            cache[cache_key] = build_offline_eval_batches(
+                tokenizer=self.tokenizer,
+                data_files=list(data_files),
+                batch_size=batch_size,
+                max_samples=max_samples,
+                max_prompt_length=max_prompt_length,
+                max_response_length=max_response_length,
+                truncation=truncation,
+            )
+        return cache[cache_key]
 
     def _use_offline_teacher_rollout_data(self) -> bool:
         distill_cfg = self.config.get("distill", {})
@@ -429,4 +464,75 @@ class WasteSDAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor_distill", logger=logger)
+        return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    def evaluate_exact_blocks_offline(self, data: DataProto):
+        assert self._is_actor
+        if self.actor.teacher_module is None:
+            raise RuntimeError("exact_blocks_eval requires actor.teacher_module to be initialized.")
+
+        data_files = data.meta_info.get("data_files", None)
+        if not data_files:
+            raise ValueError("exact_blocks_eval requires non-empty data_files in meta_info.")
+        if isinstance(data_files, str):
+            data_files = [data_files]
+        data_files = [str(path) for path in data_files]
+
+        batch_size = int(data.meta_info.get("batch_size", 64))
+        max_samples = int(data.meta_info.get("max_samples", -1))
+        max_prompt_length = int(data.meta_info.get("max_prompt_length", 1024))
+        max_response_length = int(data.meta_info.get("max_response_length", 2048))
+        truncation = str(data.meta_info.get("truncation", "right"))
+        gamma = int(data.meta_info.get("gamma", 8))
+        temperature = float(data.meta_info.get("temperature", 1.0))
+        disable_tqdm = True
+
+        batches = self._get_exact_blocks_eval_batches(
+            data_files=data_files,
+            batch_size=batch_size,
+            max_samples=max_samples,
+            max_prompt_length=max_prompt_length,
+            max_response_length=max_response_length,
+            truncation=truncation,
+        )
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        actor_module = self.actor.actor_module
+        teacher_module = self.actor.teacher_module
+        actor_was_training = actor_module.training
+        teacher_was_training = teacher_module.training
+        actor_module.eval()
+        teacher_module.eval()
+
+        started = time.time()
+        try:
+            with self.ulysses_sharding_manager:
+                result = evaluate_exact_blocks_with_models(
+                    teacher_model=teacher_module,
+                    student_model=actor_module,
+                    batches=batches,
+                    teacher_device=get_torch_device(),
+                    student_device=get_torch_device(),
+                    gamma=gamma,
+                    temperature=temperature,
+                    disable_tqdm=disable_tqdm,
+                    progress_desc="exact_blocks_eval",
+                )
+        finally:
+            if actor_was_training:
+                actor_module.train()
+            if teacher_was_training:
+                teacher_module.train()
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+        metrics = {
+            f"exact_blocks_eval/{key}": float(value) if isinstance(value, (int, float)) else value
+            for key, value in result.items()
+        }
+        metrics["exact_blocks_eval/runtime_s"] = float(time.time() - started)
+        output = DataProto(meta_info={"metrics": metrics}).to("cpu")
         return output

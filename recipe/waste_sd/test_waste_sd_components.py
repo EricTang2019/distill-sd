@@ -4,10 +4,12 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 import torch
+from torch.autograd import gradcheck
 from omegaconf import OmegaConf
 
 from verl import DataProto
@@ -21,11 +23,25 @@ from recipe.waste_sd.collect_offline_rollout import (
 from recipe.waste_sd.distill_debug import DistillDebugRecorder
 from recipe.waste_sd.distill_losses import get_distill_loss_fn
 from recipe.waste_sd.agent_loop import build_waste_sd_agent_loop_config
+from recipe.waste_sd.block_count_dp import _compute_forward_remaining_budget_tensors, compute_forward_remaining_budget_weights
 from recipe.waste_sd.fsdp_workers import WasteSDAsyncActorRolloutRefWorker
 from recipe.waste_sd.main_waste_sd import _normalize_rollout_agent_num_workers
 from recipe.waste_sd.main_teacher_off_policy import apply_teacher_off_policy_defaults
 from recipe.waste_sd.offline_rollout_dataset import OfflineTeacherRolloutDataset
-from recipe.waste_sd.dp_actor import DataParallelWasteSDDistillActor, validate_distill_objective_config
+from recipe.waste_sd.dp_actor import (
+    DataParallelWasteSDDistillActor,
+    build_mild_rembudget_bias_weights,
+    build_positive_boost_weights_from_score,
+    compute_theorem_rb_tvd_blocks_from_logits,
+    compute_theorem_rb_tvd_blocks_per_sample,
+    normalize_exact_unweighted_aux_config,
+    rembudget_tvd_bias_active,
+    resolve_exact_unweighted_aux_coef,
+    resolve_rembudget_tvd_unweighted_fkl_coef,
+    resolve_rembudget_unweighted_kl_coef,
+    soft_distill_needs_dense_log_probs,
+    validate_distill_objective_config,
+)
 from recipe.waste_sd.ray_trainer import WasteSDRayTrainer
 from recipe.waste_sd.waste_weighting import build_strict_weights
 from verl.workers.fsdp_workers import AsyncActorRolloutRefWorker
@@ -180,6 +196,69 @@ class TestDistillLosses(unittest.TestCase):
         micro_aggregated = torch.tensor(total_weighted_sum / total_weight_sum, dtype=torch.float32)
         self.assertTrue(torch.allclose(micro_aggregated, full_loss.detach().cpu(), atol=1e-6, rtol=0))
 
+    def test_tvd_from_log_probs_matches_direct_softmax_value_and_grad(self):
+        torch.manual_seed(7)
+        teacher_logits = torch.randn(2, 3, 5, dtype=torch.float32)
+        response_mask = torch.tensor(
+            [
+                [True, True, False],
+                [True, False, True],
+            ]
+        )
+        token_weights = torch.tensor(
+            [
+                [1.0, 2.0, 0.0],
+                [3.0, 0.0, 4.0],
+            ],
+            dtype=torch.float32,
+        )
+        direct_student_logits = torch.randn(2, 3, 5, dtype=torch.float32, requires_grad=True)
+        shared_student_logits = direct_student_logits.detach().clone().requires_grad_(True)
+
+        tvd_fn = get_distill_loss_fn("tvd")
+        direct_loss, direct_weighted_sum, direct_weight_sum, _ = tvd_fn(
+            direct_student_logits,
+            {"logits": teacher_logits},
+            token_weights,
+            response_mask=response_mask,
+        )
+        direct_loss.backward()
+
+        shared_student_logp = torch.log_softmax(shared_student_logits.float(), dim=-1)
+        teacher_logp = torch.log_softmax(teacher_logits.float(), dim=-1)
+        token_div = DataParallelWasteSDDistillActor._token_tvd_from_log_probs(shared_student_logp, teacher_logp)
+        flat_mask = response_mask.reshape(-1)
+        token_div_flat = token_div.reshape(-1)[flat_mask]
+        weight_flat = token_weights.reshape(-1)[flat_mask]
+        shared_weighted_sum = torch.sum(token_div_flat * weight_flat)
+        shared_weight_sum = torch.sum(weight_flat)
+        shared_loss = shared_weighted_sum / shared_weight_sum
+        shared_loss.backward()
+
+        self.assertTrue(torch.allclose(shared_weighted_sum.detach(), direct_weighted_sum.detach(), atol=1e-6, rtol=0))
+        self.assertTrue(torch.allclose(shared_weight_sum.detach(), direct_weight_sum.detach(), atol=1e-6, rtol=0))
+        self.assertTrue(torch.allclose(shared_loss.detach(), direct_loss.detach(), atol=1e-6, rtol=0))
+        self.assertTrue(torch.allclose(shared_student_logits.grad, direct_student_logits.grad, atol=1e-6, rtol=1e-5))
+
+    def test_tvd_from_log_probs_matches_naive_logprob_gradient(self):
+        torch.manual_seed(17)
+        student_logp_custom = torch.log_softmax(torch.randn(2, 4, 6, dtype=torch.float64), dim=-1).requires_grad_(True)
+        teacher_logp_custom = torch.log_softmax(torch.randn(2, 4, 6, dtype=torch.float64), dim=-1).requires_grad_(True)
+        student_logp_ref = student_logp_custom.detach().clone().requires_grad_(True)
+        teacher_logp_ref = teacher_logp_custom.detach().clone().requires_grad_(True)
+
+        custom = DataParallelWasteSDDistillActor._token_tvd_from_log_probs(student_logp_custom, teacher_logp_custom).sum()
+        custom.backward()
+
+        student_prob_ref = torch.exp(student_logp_ref)
+        teacher_prob_ref = torch.exp(teacher_logp_ref)
+        reference = 0.5 * torch.sum(torch.abs(student_prob_ref - teacher_prob_ref), dim=-1).sum()
+        reference.backward()
+
+        self.assertTrue(torch.allclose(custom.detach(), reference.detach(), atol=1e-10, rtol=0))
+        self.assertTrue(torch.allclose(student_logp_custom.grad, student_logp_ref.grad, atol=1e-10, rtol=1e-9))
+        self.assertTrue(torch.allclose(teacher_logp_custom.grad, teacher_logp_ref.grad, atol=1e-10, rtol=1e-9))
+
     def test_teacher_greedy_nll_matches_manual(self):
         student_logits = torch.tensor(
             [
@@ -269,7 +348,7 @@ class TestDistillObjectiveValidation(unittest.TestCase):
                 weighting_mode="waste",
                 kl_floor_coef=0.0,
                 rembudget_unweighted_kl_coef=0.0,
-                exact_unweighted_kl_coef=0.0,
+                exact_unweighted_aux_coef=0.0,
             )
 
     def test_teacher_greedy_nll_accepts_uniform_mean(self):
@@ -278,7 +357,7 @@ class TestDistillObjectiveValidation(unittest.TestCase):
             weighting_mode="uniform_mean",
             kl_floor_coef=0.0,
             rembudget_unweighted_kl_coef=0.0,
-            exact_unweighted_kl_coef=0.0,
+            exact_unweighted_aux_coef=0.0,
         )
 
     def test_exact_block_count_wnll_requires_uniform_mean(self):
@@ -288,7 +367,7 @@ class TestDistillObjectiveValidation(unittest.TestCase):
                 weighting_mode="remaining_budget_forward",
                 kl_floor_coef=0.0,
                 rembudget_unweighted_kl_coef=0.0,
-                exact_unweighted_kl_coef=0.0,
+                exact_unweighted_aux_coef=0.0,
             )
 
     def test_exact_block_count_wnll_accepts_uniform_mean(self):
@@ -297,27 +376,92 @@ class TestDistillObjectiveValidation(unittest.TestCase):
             weighting_mode="uniform_mean",
             kl_floor_coef=0.0,
             rembudget_unweighted_kl_coef=0.0,
-            exact_unweighted_kl_coef=0.0,
+            exact_unweighted_aux_coef=0.0,
         )
 
-    def test_exact_unweighted_kl_coef_requires_exact_loss(self):
+    def test_exact_unweighted_aux_coef_requires_exact_loss(self):
         with self.assertRaisesRegex(ValueError, "only applies to"):
             validate_distill_objective_config(
                 loss_type="fkl",
                 weighting_mode="uniform_mean",
                 kl_floor_coef=0.0,
                 rembudget_unweighted_kl_coef=0.0,
-                exact_unweighted_kl_coef=0.2,
+                exact_unweighted_aux_coef=0.2,
             )
 
-    def test_exact_unweighted_kl_coef_accepts_exact_loss(self):
+    def test_exact_unweighted_aux_coef_accepts_exact_loss(self):
         validate_distill_objective_config(
             loss_type="exact_block_count_wnll",
             weighting_mode="uniform_mean",
             kl_floor_coef=0.0,
             rembudget_unweighted_kl_coef=0.0,
-            exact_unweighted_kl_coef=0.2,
+            exact_unweighted_aux_coef=0.2,
         )
+
+    def test_exact_unweighted_aux_accepts_tvd(self):
+        validate_distill_objective_config(
+            loss_type="exact_block_count_wnll",
+            weighting_mode="uniform_mean",
+            kl_floor_coef=0.0,
+            rembudget_unweighted_kl_coef=0.0,
+            exact_unweighted_aux_loss_type="tvd",
+            exact_unweighted_aux_coef=0.2,
+        )
+
+    def test_exact_unweighted_aux_linear_schedule_accepts_exact_loss(self):
+        validate_distill_objective_config(
+            loss_type="exact_block_count_wnll",
+            weighting_mode="uniform_mean",
+            kl_floor_coef=0.0,
+            rembudget_unweighted_kl_coef=0.0,
+            exact_unweighted_aux_coef=0.5,
+            exact_unweighted_aux_coef_schedule="linear",
+            exact_unweighted_aux_coef_start=1.0,
+            exact_unweighted_aux_coef_end=0.5,
+            exact_unweighted_aux_coef_start_step=0,
+            exact_unweighted_aux_coef_end_step=100,
+        )
+
+    def test_exact_unweighted_aux_linear_schedule_requires_exact_loss(self):
+        with self.assertRaisesRegex(ValueError, "only applies to"):
+            validate_distill_objective_config(
+                loss_type="fkl",
+                weighting_mode="uniform_mean",
+                kl_floor_coef=0.0,
+                rembudget_unweighted_kl_coef=0.0,
+                exact_unweighted_aux_coef=0.0,
+                exact_unweighted_aux_coef_schedule="linear",
+                exact_unweighted_aux_coef_start=1.0,
+                exact_unweighted_aux_coef_end=0.5,
+                exact_unweighted_aux_coef_start_step=0,
+                exact_unweighted_aux_coef_end_step=100,
+            )
+
+    def test_exact_unweighted_aux_linear_schedule_end_step_must_follow_start_step(self):
+        with self.assertRaisesRegex(ValueError, "end_step must be >="):
+            validate_distill_objective_config(
+                loss_type="exact_block_count_wnll",
+                weighting_mode="uniform_mean",
+                kl_floor_coef=0.0,
+                rembudget_unweighted_kl_coef=0.0,
+                exact_unweighted_aux_coef=0.0,
+                exact_unweighted_aux_coef_schedule="linear",
+                exact_unweighted_aux_coef_start=1.0,
+                exact_unweighted_aux_coef_end=0.5,
+                exact_unweighted_aux_coef_start_step=100,
+                exact_unweighted_aux_coef_end_step=50,
+            )
+
+    def test_exact_unweighted_aux_requires_supported_loss_type(self):
+        with self.assertRaisesRegex(ValueError, "must be one of"):
+            validate_distill_objective_config(
+                loss_type="exact_block_count_wnll",
+                weighting_mode="uniform_mean",
+                kl_floor_coef=0.0,
+                rembudget_unweighted_kl_coef=0.0,
+                exact_unweighted_aux_loss_type="rkl",
+                exact_unweighted_aux_coef=0.2,
+            )
 
     def test_rembudget_unweighted_kl_coef_requires_remaining_budget_mode(self):
         with self.assertRaisesRegex(ValueError, "only applies to"):
@@ -326,7 +470,7 @@ class TestDistillObjectiveValidation(unittest.TestCase):
                 weighting_mode="uniform_mean",
                 kl_floor_coef=0.0,
                 rembudget_unweighted_kl_coef=0.2,
-                exact_unweighted_kl_coef=0.0,
+                exact_unweighted_aux_coef=0.0,
             )
 
     def test_rembudget_forward_accepts_tvd(self):
@@ -335,8 +479,80 @@ class TestDistillObjectiveValidation(unittest.TestCase):
             weighting_mode="remaining_budget_forward",
             kl_floor_coef=0.0,
             rembudget_unweighted_kl_coef=0.0,
-            exact_unweighted_kl_coef=0.0,
+            exact_unweighted_aux_coef=0.0,
         )
+
+    def test_theorem_unnormalized_rembudget_tvd_accepts_strict_forward_tvd(self):
+        validate_distill_objective_config(
+            loss_type="tvd",
+            weighting_mode="remaining_budget_forward",
+            kl_floor_coef=0.0,
+            rembudget_tvd_objective_mode="theorem_unnormalized",
+            rembudget_unweighted_kl_coef=0.0,
+            rembudget_tvd_unweighted_fkl_coef=0.0,
+            exact_unweighted_aux_coef=0.0,
+        )
+
+    def test_theorem_unnormalized_rembudget_tvd_rejects_nonzero_floor(self):
+        with self.assertRaisesRegex(ValueError, "kl_floor_coef=0.0"):
+            validate_distill_objective_config(
+                loss_type="tvd",
+                weighting_mode="remaining_budget_forward",
+                kl_floor_coef=0.1,
+                rembudget_tvd_objective_mode="theorem_unnormalized",
+                rembudget_unweighted_kl_coef=0.0,
+                rembudget_tvd_unweighted_fkl_coef=0.0,
+                exact_unweighted_aux_coef=0.0,
+            )
+
+    def test_theorem_unnormalized_rembudget_tvd_rejects_mixing(self):
+        with self.assertRaisesRegex(ValueError, "does not support rembudget mixing"):
+            validate_distill_objective_config(
+                loss_type="tvd",
+                weighting_mode="remaining_budget_forward",
+                kl_floor_coef=0.0,
+                rembudget_tvd_objective_mode="theorem_unnormalized",
+                rembudget_unweighted_kl_coef=0.2,
+                rembudget_tvd_unweighted_fkl_coef=0.0,
+                exact_unweighted_aux_coef=0.0,
+            )
+
+    def test_theorem_unnormalized_rembudget_tvd_requires_forward_tvd(self):
+        with self.assertRaisesRegex(ValueError, "only applies to"):
+            validate_distill_objective_config(
+                loss_type="fkl",
+                weighting_mode="remaining_budget_forward",
+                kl_floor_coef=0.0,
+                rembudget_tvd_objective_mode="theorem_unnormalized",
+                rembudget_unweighted_kl_coef=0.0,
+                rembudget_tvd_unweighted_fkl_coef=0.0,
+                exact_unweighted_aux_coef=0.0,
+            )
+
+    def test_theorem_unnormalized_rembudget_tvd_accepts_backward_length_normalize(self):
+        validate_distill_objective_config(
+            loss_type="tvd",
+            weighting_mode="remaining_budget_forward",
+            kl_floor_coef=0.0,
+            rembudget_tvd_objective_mode="theorem_unnormalized",
+            rembudget_tvd_backward_length_normalize=True,
+            rembudget_unweighted_kl_coef=0.0,
+            rembudget_tvd_unweighted_fkl_coef=0.0,
+            exact_unweighted_aux_coef=0.0,
+        )
+
+    def test_backward_length_normalize_requires_theorem_mode(self):
+        with self.assertRaisesRegex(ValueError, "only applies to"):
+            validate_distill_objective_config(
+                loss_type="tvd",
+                weighting_mode="remaining_budget_forward",
+                kl_floor_coef=0.0,
+                rembudget_tvd_objective_mode="weighted_mean",
+                rembudget_tvd_backward_length_normalize=True,
+                rembudget_unweighted_kl_coef=0.0,
+                rembudget_tvd_unweighted_fkl_coef=0.0,
+                exact_unweighted_aux_coef=0.0,
+            )
 
     def test_rembudget_unweighted_kl_coef_accepts_forward_fkl(self):
         validate_distill_objective_config(
@@ -344,7 +560,7 @@ class TestDistillObjectiveValidation(unittest.TestCase):
             weighting_mode="remaining_budget_forward",
             kl_floor_coef=0.0,
             rembudget_unweighted_kl_coef=0.2,
-            exact_unweighted_kl_coef=0.0,
+            exact_unweighted_aux_coef=0.0,
         )
 
     def test_rembudget_unweighted_kl_coef_accepts_forward_tvd(self):
@@ -353,8 +569,306 @@ class TestDistillObjectiveValidation(unittest.TestCase):
             weighting_mode="remaining_budget_forward",
             kl_floor_coef=0.0,
             rembudget_unweighted_kl_coef=0.2,
-            exact_unweighted_kl_coef=0.0,
+            exact_unweighted_aux_coef=0.0,
         )
+
+    def test_rembudget_unweighted_kl_linear_schedule_accepts_forward_tvd(self):
+        validate_distill_objective_config(
+            loss_type="tvd",
+            weighting_mode="remaining_budget_forward",
+            kl_floor_coef=0.0,
+            rembudget_unweighted_kl_coef=0.0,
+            rembudget_unweighted_kl_coef_schedule="linear",
+            rembudget_unweighted_kl_coef_start=1.0,
+            rembudget_unweighted_kl_coef_end=0.0,
+            rembudget_unweighted_kl_coef_start_step=0,
+            rembudget_unweighted_kl_coef_end_step=100,
+            exact_unweighted_aux_coef=0.0,
+        )
+
+    def test_rembudget_tvd_unweighted_fkl_linear_schedule_accepts_forward_tvd(self):
+        validate_distill_objective_config(
+            loss_type="tvd",
+            weighting_mode="remaining_budget_forward",
+            kl_floor_coef=0.0,
+            rembudget_unweighted_kl_coef=0.0,
+            rembudget_tvd_unweighted_fkl_coef=0.0,
+            rembudget_tvd_unweighted_fkl_coef_schedule="linear",
+            rembudget_tvd_unweighted_fkl_coef_start=1.0,
+            rembudget_tvd_unweighted_fkl_coef_end=0.0,
+            rembudget_tvd_unweighted_fkl_coef_start_step=0,
+            rembudget_tvd_unweighted_fkl_coef_end_step=100,
+            exact_unweighted_aux_coef=0.0,
+        )
+
+    def test_rembudget_tvd_unweighted_fkl_requires_forward_tvd(self):
+        with self.assertRaisesRegex(ValueError, "only applies to"):
+            validate_distill_objective_config(
+                loss_type="fkl",
+                weighting_mode="remaining_budget_forward",
+                kl_floor_coef=0.0,
+                rembudget_unweighted_kl_coef=0.0,
+                rembudget_tvd_unweighted_fkl_coef=0.2,
+                exact_unweighted_aux_coef=0.0,
+            )
+
+    def test_rembudget_mix_paths_are_mutually_exclusive(self):
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            validate_distill_objective_config(
+                loss_type="tvd",
+                weighting_mode="remaining_budget_forward",
+                kl_floor_coef=0.0,
+                rembudget_unweighted_kl_coef=0.2,
+                rembudget_tvd_unweighted_fkl_coef=0.2,
+                exact_unweighted_aux_coef=0.0,
+            )
+
+    def test_tvd_rembudget_bias_accepts_uniform_tvd(self):
+        validate_distill_objective_config(
+            loss_type="tvd",
+            weighting_mode="uniform_mean",
+            kl_floor_coef=0.0,
+            rembudget_unweighted_kl_coef=0.0,
+            exact_unweighted_aux_coef=0.0,
+            tvd_rembudget_bias_score_type="rembudget_tvd",
+            tvd_rembudget_bias_coef=0.1,
+            tvd_rembudget_bias_power=0.5,
+            tvd_rembudget_bias_eps=1e-3,
+            tvd_rembudget_bias_clip=0.5,
+            tvd_rembudget_bias_start_step=100,
+        )
+
+    def test_tvd_rembudget_bias_rejects_unknown_score_type(self):
+        with self.assertRaisesRegex(ValueError, "must be one of"):
+            validate_distill_objective_config(
+                loss_type="tvd",
+                weighting_mode="uniform_mean",
+                kl_floor_coef=0.0,
+                rembudget_unweighted_kl_coef=0.0,
+                exact_unweighted_aux_coef=0.0,
+                tvd_rembudget_bias_score_type="bad_mode",
+                tvd_rembudget_bias_coef=0.1,
+            )
+
+    def test_tvd_rembudget_bias_requires_uniform_tvd(self):
+        with self.assertRaisesRegex(ValueError, "only applies to"):
+            validate_distill_objective_config(
+                loss_type="fkl",
+                weighting_mode="uniform_mean",
+                kl_floor_coef=0.0,
+                rembudget_unweighted_kl_coef=0.0,
+                exact_unweighted_aux_coef=0.0,
+                tvd_rembudget_bias_coef=0.1,
+            )
+        with self.assertRaisesRegex(ValueError, "only applies to"):
+            validate_distill_objective_config(
+                loss_type="tvd",
+                weighting_mode="remaining_budget_forward",
+                kl_floor_coef=0.0,
+                rembudget_unweighted_kl_coef=0.0,
+                exact_unweighted_aux_coef=0.0,
+                tvd_rembudget_bias_coef=0.1,
+            )
+
+    def test_tvd_rembudget_bias_rejects_invalid_hyperparameters(self):
+        with self.assertRaisesRegex(ValueError, "must be > 0"):
+            validate_distill_objective_config(
+                loss_type="tvd",
+                weighting_mode="uniform_mean",
+                kl_floor_coef=0.0,
+                rembudget_unweighted_kl_coef=0.0,
+                exact_unweighted_aux_coef=0.0,
+                tvd_rembudget_bias_coef=0.1,
+                tvd_rembudget_bias_power=0.0,
+            )
+        with self.assertRaisesRegex(ValueError, "must be >= 0"):
+            validate_distill_objective_config(
+                loss_type="tvd",
+                weighting_mode="uniform_mean",
+                kl_floor_coef=0.0,
+                rembudget_unweighted_kl_coef=0.0,
+                exact_unweighted_aux_coef=0.0,
+                tvd_rembudget_bias_coef=0.1,
+                tvd_rembudget_bias_eps=-1e-3,
+            )
+        with self.assertRaisesRegex(ValueError, "must be > 0"):
+            validate_distill_objective_config(
+                loss_type="tvd",
+                weighting_mode="uniform_mean",
+                kl_floor_coef=0.0,
+                rembudget_unweighted_kl_coef=0.0,
+                exact_unweighted_aux_coef=0.0,
+                tvd_rembudget_bias_coef=0.1,
+                tvd_rembudget_bias_clip=0.0,
+            )
+        with self.assertRaisesRegex(ValueError, "must be >= 0"):
+            validate_distill_objective_config(
+                loss_type="tvd",
+                weighting_mode="uniform_mean",
+                kl_floor_coef=0.0,
+                rembudget_unweighted_kl_coef=0.0,
+                exact_unweighted_aux_coef=0.0,
+                tvd_rembudget_bias_coef=0.1,
+                tvd_rembudget_bias_start_step=-1,
+            )
+
+
+class TestMildRembudgetBias(unittest.TestCase):
+    def test_bias_activation_respects_coef_and_start_step(self):
+        self.assertFalse(rembudget_tvd_bias_active(current_step=0, coef=0.0, start_step=0))
+        self.assertFalse(rembudget_tvd_bias_active(current_step=9, coef=0.1, start_step=10))
+        self.assertTrue(rembudget_tvd_bias_active(current_step=10, coef=0.1, start_step=10))
+
+    def test_build_mild_bias_is_masked_and_one_sided(self):
+        rembudget_weights = torch.tensor(
+            [
+                [0.2, 0.8, 1.0, 0.5],
+                [0.7, 0.3, 0.9, 0.1],
+            ],
+            dtype=torch.float32,
+        )
+        response_mask = torch.tensor(
+            [
+                [True, True, True, False],
+                [True, False, True, True],
+            ]
+        )
+
+        bias = build_mild_rembudget_bias_weights(
+            rembudget_weights,
+            response_mask,
+            coef=0.2,
+            power=0.5,
+            eps=1e-3,
+            clip=0.5,
+        )
+
+        self.assertEqual(tuple(bias.shape), tuple(rembudget_weights.shape))
+        self.assertTrue(torch.allclose(bias[~response_mask], torch.zeros_like(bias[~response_mask])))
+        self.assertTrue(torch.all(bias[response_mask] >= 1.0))
+        self.assertGreater(float(bias[0, 2].item()), 1.0)
+        self.assertAlmostEqual(float(bias[0, 0].item()), 1.0, places=6)
+
+    def test_build_mild_bias_returns_uniform_weights_when_disabled(self):
+        rembudget_weights = torch.tensor([[0.2, 0.8, 1.0]], dtype=torch.float32)
+        response_mask = torch.tensor([[True, True, False]])
+
+        bias = build_mild_rembudget_bias_weights(
+            rembudget_weights,
+            response_mask,
+            coef=0.0,
+            power=0.5,
+            eps=1e-3,
+            clip=0.5,
+        )
+
+        expected = torch.tensor([[1.0, 1.0, 0.0]], dtype=torch.float32)
+        self.assertTrue(torch.allclose(bias, expected, atol=1e-6, rtol=0.0))
+
+    def test_build_mild_bias_clips_large_positive_centered_weights(self):
+        rembudget_weights = torch.tensor([[0.01, 0.04, 1.0]], dtype=torch.float32)
+        response_mask = torch.tensor([[True, True, True]])
+
+        bias = build_mild_rembudget_bias_weights(
+            rembudget_weights,
+            response_mask,
+            coef=0.5,
+            power=1.0,
+            eps=0.0,
+            clip=0.25,
+        )
+
+        self.assertTrue(torch.all(bias[response_mask] <= 1.125 + 1e-6))
+
+    def test_build_positive_boost_weights_from_score_is_one_sided(self):
+        score = torch.tensor([[0.2, 0.8, 2.0, 0.0]], dtype=torch.float32)
+        response_mask = torch.tensor([[True, True, True, False]])
+
+        bias = build_positive_boost_weights_from_score(
+            score,
+            response_mask,
+            coef=0.1,
+            clip=0.5,
+        )
+
+        self.assertAlmostEqual(float(bias[0, 0].item()), 1.0, places=6)
+        self.assertAlmostEqual(float(bias[0, 1].item()), 1.0, places=6)
+        self.assertGreater(float(bias[0, 2].item()), 1.0)
+        self.assertEqual(float(bias[0, 3].item()), 0.0)
+
+
+class TestExactUnweightedAuxConfig(unittest.TestCase):
+    def test_generic_exact_aux_config_passes_through(self):
+        config = normalize_exact_unweighted_aux_config(
+            {
+                "exact_unweighted_aux_loss_type": "tvd",
+                "exact_unweighted_aux_coef": 0.3,
+                "exact_unweighted_aux_coef_schedule": "linear",
+                "exact_unweighted_aux_coef_start": 1.0,
+                "exact_unweighted_aux_coef_end": 0.3,
+                "exact_unweighted_aux_coef_start_step": 0,
+                "exact_unweighted_aux_coef_end_step": 100,
+            }
+        )
+
+        self.assertEqual(config["loss_type"], "tvd")
+        self.assertEqual(config["coef"], 0.3)
+        self.assertEqual(config["schedule"], "linear")
+        self.assertEqual(config["start"], 1.0)
+        self.assertEqual(config["end"], 0.3)
+        self.assertEqual(config["start_step"], 0)
+        self.assertEqual(config["end_step"], 100)
+
+    def test_legacy_exact_tvd_maps_to_generic_aux_config(self):
+        config = normalize_exact_unweighted_aux_config(
+            {
+                "exact_unweighted_tvd_coef": 0.4,
+                "exact_unweighted_tvd_coef_schedule": "linear",
+                "exact_unweighted_tvd_coef_start": 1.0,
+                "exact_unweighted_tvd_coef_end": 0.4,
+                "exact_unweighted_tvd_coef_start_step": 0,
+                "exact_unweighted_tvd_coef_end_step": 200,
+            }
+        )
+
+        self.assertEqual(config["loss_type"], "tvd")
+        self.assertEqual(config["coef"], 0.4)
+        self.assertEqual(config["schedule"], "linear")
+        self.assertEqual(config["start"], 1.0)
+        self.assertEqual(config["end"], 0.4)
+        self.assertEqual(config["end_step"], 200)
+
+    def test_legacy_exact_tvd_overrides_default_generic_yaml_fields(self):
+        config = normalize_exact_unweighted_aux_config(
+            {
+                "exact_unweighted_aux_loss_type": "fkl",
+                "exact_unweighted_aux_coef": 0.0,
+                "exact_unweighted_aux_coef_schedule": "constant",
+                "exact_unweighted_aux_coef_start": 0.0,
+                "exact_unweighted_aux_coef_end": 0.0,
+                "exact_unweighted_aux_coef_start_step": 0,
+                "exact_unweighted_aux_coef_end_step": 0,
+                "exact_unweighted_tvd_coef": 0.4,
+                "exact_unweighted_tvd_coef_schedule": "linear",
+                "exact_unweighted_tvd_coef_start": 1.0,
+                "exact_unweighted_tvd_coef_end": 0.4,
+                "exact_unweighted_tvd_coef_start_step": 0,
+                "exact_unweighted_tvd_coef_end_step": 200,
+            }
+        )
+
+        self.assertEqual(config["loss_type"], "tvd")
+        self.assertEqual(config["coef"], 0.4)
+
+    def test_generic_and_legacy_exact_aux_configs_are_mutually_exclusive(self):
+        with self.assertRaisesRegex(ValueError, "Do not mix"):
+            normalize_exact_unweighted_aux_config(
+                {
+                    "exact_unweighted_aux_loss_type": "fkl",
+                    "exact_unweighted_aux_coef": 0.2,
+                    "exact_unweighted_kl_coef": 0.2,
+                }
+            )
 
 
 class TestPatchDataPathHelpers(unittest.TestCase):
@@ -363,6 +877,352 @@ class TestPatchDataPathHelpers(unittest.TestCase):
             self.skipTest("agent loop helper import unavailable in this environment")
         trimmed = _trim_accept_lens([3, 3, 3], max_tokens=7)
         self.assertEqual(trimmed, [3, 3, 1])
+
+
+class TestExactUnweightedAuxSchedule(unittest.TestCase):
+    def test_constant_schedule_uses_base_coef(self):
+        self.assertEqual(
+            resolve_exact_unweighted_aux_coef(current_step=50, base_coef=0.3),
+            0.3,
+        )
+
+    def test_linear_schedule_interpolates(self):
+        self.assertEqual(
+            resolve_exact_unweighted_aux_coef(
+                current_step=0,
+                base_coef=0.5,
+                schedule="linear",
+                start_coef=1.0,
+                end_coef=0.5,
+                start_step=0,
+                end_step=100,
+            ),
+            1.0,
+        )
+        self.assertAlmostEqual(
+            resolve_exact_unweighted_aux_coef(
+                current_step=50,
+                base_coef=0.5,
+                schedule="linear",
+                start_coef=1.0,
+                end_coef=0.5,
+                start_step=0,
+                end_step=100,
+            ),
+            0.75,
+        )
+        self.assertEqual(
+            resolve_exact_unweighted_aux_coef(
+                current_step=100,
+                base_coef=0.5,
+                schedule="linear",
+                start_coef=1.0,
+                end_coef=0.5,
+                start_step=0,
+                end_step=100,
+            ),
+            0.5,
+        )
+
+
+class TestRembudgetSchedules(unittest.TestCase):
+    def test_rembudget_same_loss_linear_schedule_interpolates(self):
+        self.assertEqual(
+            resolve_rembudget_unweighted_kl_coef(
+                current_step=0,
+                base_coef=0.0,
+                schedule="linear",
+                start_coef=1.0,
+                end_coef=0.0,
+                start_step=0,
+                end_step=100,
+            ),
+            1.0,
+        )
+        self.assertAlmostEqual(
+            resolve_rembudget_unweighted_kl_coef(
+                current_step=50,
+                base_coef=0.0,
+                schedule="linear",
+                start_coef=1.0,
+                end_coef=0.0,
+                start_step=0,
+                end_step=100,
+            ),
+            0.5,
+        )
+
+    def test_rembudget_tvd_unweighted_fkl_linear_schedule_interpolates(self):
+        self.assertAlmostEqual(
+            resolve_rembudget_tvd_unweighted_fkl_coef(
+                current_step=25,
+                base_coef=0.0,
+                schedule="linear",
+                start_coef=1.0,
+                end_coef=0.0,
+                start_step=0,
+                end_step=100,
+            ),
+            0.75,
+        )
+
+
+class TestSoftDistillDenseLogProbRouting(unittest.TestCase):
+    def test_tvd_same_loss_rembudget_mix_does_not_need_dense_log_probs(self):
+        self.assertFalse(
+            soft_distill_needs_dense_log_probs(
+                loss_type="tvd",
+                rembudget_unweighted_kl_coef=0.8,
+                rembudget_tvd_unweighted_fkl_coef=0.0,
+            )
+        )
+
+    def test_fkl_path_needs_dense_log_probs(self):
+        self.assertTrue(
+            soft_distill_needs_dense_log_probs(
+                loss_type="fkl",
+                rembudget_unweighted_kl_coef=0.8,
+                rembudget_tvd_unweighted_fkl_coef=0.0,
+            )
+        )
+
+    def test_tvd_plus_unweighted_fkl_mix_needs_dense_log_probs(self):
+        self.assertTrue(
+            soft_distill_needs_dense_log_probs(
+                loss_type="tvd",
+                rembudget_unweighted_kl_coef=0.0,
+                rembudget_tvd_unweighted_fkl_coef=0.2,
+            )
+        )
+
+
+class TestCurrentBatchTheoremRBTVD(unittest.TestCase):
+    def test_blocks_match_closed_form(self):
+        remaining_budget_weight = torch.tensor([[1.0, 0.5, 0.0]], dtype=torch.float32)
+        token_tvd = torch.tensor([[0.2, 0.4, 0.6]], dtype=torch.float32)
+        response_mask = torch.tensor([[True, True, False]])
+
+        blocks = compute_theorem_rb_tvd_blocks_per_sample(
+            remaining_budget_weight=remaining_budget_weight,
+            token_tvd=token_tvd,
+            response_mask=response_mask,
+            gamma=2,
+        )
+
+        # T=2 valid tokens, gamma=2:
+        # T/(gamma+1) + gamma/(gamma+1) * sum_n w_n^rem * TVD_n
+        expected = (2.0 / 3.0) + (2.0 / 3.0) * (1.0 * 0.2 + 0.5 * 0.4)
+        self.assertAlmostEqual(float(blocks.item()), expected, places=6)
+
+    def test_blocks_from_logits_matches_component_composition(self):
+        torch.manual_seed(17)
+        teacher_logits = torch.randn(2, 3, 5, dtype=torch.float32)
+        student_logits = torch.randn(2, 3, 5, dtype=torch.float32)
+        responses = torch.tensor([[0, 1, 2], [3, 4, 0]], dtype=torch.long)
+        response_mask = torch.tensor([[True, True, False], [True, False, True]])
+
+        helper_blocks = compute_theorem_rb_tvd_blocks_from_logits(
+            teacher_logits=teacher_logits,
+            student_logits=student_logits,
+            responses=responses,
+            response_mask=response_mask,
+            gamma=3,
+            kl_floor_coef=0.0,
+            dp_dtype=torch.float64,
+        )
+
+        teacher_logp = torch.log_softmax(teacher_logits.float(), dim=-1)
+        student_logp = torch.log_softmax(student_logits.float(), dim=-1)
+        teacher_token_logprobs = torch.gather(teacher_logp, dim=-1, index=responses.unsqueeze(-1)).squeeze(-1)
+        student_token_logprobs = torch.gather(student_logp, dim=-1, index=responses.unsqueeze(-1)).squeeze(-1)
+        forward = compute_forward_remaining_budget_weights(
+            teacher_logprobs=teacher_token_logprobs,
+            student_logprobs=student_token_logprobs,
+            gamma=3,
+            response_mask=response_mask,
+            kl_floor_coef=0.0,
+            dp_dtype=torch.float64,
+        )
+        token_tvd = DataParallelWasteSDDistillActor._token_tvd_from_log_probs(student_logp, teacher_logp)
+        reference_blocks = compute_theorem_rb_tvd_blocks_per_sample(
+            remaining_budget_weight=forward.remaining_budget_weight,
+            token_tvd=token_tvd,
+            response_mask=response_mask,
+            gamma=3,
+        )
+
+        self.assertTrue(torch.allclose(helper_blocks, reference_blocks, atol=1e-6, rtol=0))
+
+    def test_theorem_blocks_support_full_autodiff_through_remaining_budget(self):
+        teacher_logprobs = torch.tensor([[-0.2, -0.4, -0.3]], dtype=torch.float32)
+        student_logprobs = torch.tensor([[-0.6, -0.1, -0.8]], dtype=torch.float32, requires_grad=True)
+        token_tvd = torch.tensor([[0.5, 0.2, 0.7]], dtype=torch.float32)
+        response_mask = torch.tensor([[True, True, True]])
+
+        forward = compute_forward_remaining_budget_weights(
+            teacher_logprobs=teacher_logprobs,
+            student_logprobs=student_logprobs,
+            gamma=2,
+            response_mask=response_mask,
+            kl_floor_coef=0.0,
+            dp_dtype=torch.float64,
+        )
+        loss = compute_theorem_rb_tvd_blocks_per_sample(
+            remaining_budget_weight=forward.remaining_budget_weight,
+            token_tvd=token_tvd,
+            response_mask=response_mask,
+            gamma=2,
+        ).sum()
+        loss.backward()
+
+        self.assertIsNotNone(student_logprobs.grad)
+        self.assertTrue(torch.isfinite(student_logprobs.grad).all())
+        self.assertGreater(student_logprobs.grad.abs().sum().item(), 0.0)
+
+    def test_forward_remaining_budget_custom_backward_matches_reference_autograd(self):
+        teacher_logprobs = torch.tensor([[-0.2, -0.4, -0.3, -0.1]], dtype=torch.float32)
+        token_tvd = torch.tensor([[0.5, 0.2, 0.7, 0.1]], dtype=torch.float32)
+        response_mask = torch.tensor([[True, True, True, False]])
+
+        student_logprobs_custom = torch.tensor(
+            [[-0.6, -0.1, -0.8, -0.5]],
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        student_logprobs_ref = student_logprobs_custom.detach().clone().requires_grad_(True)
+
+        forward_custom = compute_forward_remaining_budget_weights(
+            teacher_logprobs=teacher_logprobs,
+            student_logprobs=student_logprobs_custom,
+            gamma=2,
+            response_mask=response_mask,
+            kl_floor_coef=0.0,
+            dp_dtype=torch.float64,
+        )
+        loss_custom = compute_theorem_rb_tvd_blocks_per_sample(
+            remaining_budget_weight=forward_custom.remaining_budget_weight,
+            token_tvd=token_tvd,
+            response_mask=response_mask,
+            gamma=2,
+        ).sum()
+        loss_custom.backward()
+
+        (
+            _teacher_ref,
+            _student_ref,
+            _log_ratio_ref,
+            _ratio_ref,
+            _reject_ref,
+            _occupancy_ref,
+            _expected_ref,
+            remaining_budget_weight_ref,
+            _mixed_ref,
+        ) = _compute_forward_remaining_budget_tensors(
+            teacher_logprobs=teacher_logprobs,
+            student_logprobs=student_logprobs_ref,
+            gamma=2,
+            response_mask=response_mask,
+            kl_floor_coef=0.0,
+            dp_dtype=torch.float64,
+        )
+        loss_ref = compute_theorem_rb_tvd_blocks_per_sample(
+            remaining_budget_weight=remaining_budget_weight_ref,
+            token_tvd=token_tvd,
+            response_mask=response_mask,
+            gamma=2,
+        ).sum()
+        loss_ref.backward()
+
+        self.assertTrue(torch.allclose(forward_custom.remaining_budget_weight, remaining_budget_weight_ref, atol=1e-8))
+        self.assertIsNotNone(student_logprobs_custom.grad)
+        self.assertIsNotNone(student_logprobs_ref.grad)
+        self.assertTrue(torch.allclose(student_logprobs_custom.grad, student_logprobs_ref.grad, atol=1e-6, rtol=1e-5))
+
+    def test_forward_remaining_budget_gradcheck_reference_and_custom(self):
+        teacher_logprobs = torch.tensor(
+            [[-0.2, -0.4, -0.3, -0.1], [-0.5, -0.3, -0.6, -0.2]],
+            dtype=torch.float64,
+        )
+        response_mask = torch.tensor([[True, True, True, True], [True, True, True, False]])
+        student_logprobs_ref = torch.tensor(
+            [[-0.6, -0.1, -0.8, -0.5], [-0.2, -0.7, -0.4, -0.9]],
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        student_logprobs_custom = student_logprobs_ref.detach().clone().requires_grad_(True)
+
+        def ref_fn(student_logprobs):
+            outputs = _compute_forward_remaining_budget_tensors(
+                teacher_logprobs=teacher_logprobs,
+                student_logprobs=student_logprobs,
+                gamma=3,
+                response_mask=response_mask,
+                kl_floor_coef=0.0,
+                dp_dtype=torch.float64,
+            )
+            return (outputs[7].sum(),)
+
+        def custom_fn(student_logprobs):
+            outputs = compute_forward_remaining_budget_weights(
+                teacher_logprobs=teacher_logprobs,
+                student_logprobs=student_logprobs,
+                gamma=3,
+                response_mask=response_mask,
+                kl_floor_coef=0.0,
+                dp_dtype=torch.float64,
+            )
+            return (outputs.remaining_budget_weight.sum(),)
+
+        self.assertTrue(gradcheck(ref_fn, (student_logprobs_ref,), eps=1e-6, atol=1e-4, rtol=1e-3))
+        self.assertTrue(gradcheck(custom_fn, (student_logprobs_custom,), eps=1e-6, atol=1e-4, rtol=1e-3))
+
+
+class TestStudentNLLStats(unittest.TestCase):
+    def test_token_logprob_stats_match_logits_path(self):
+        logits = torch.tensor(
+            [
+                [
+                    [2.0, 0.0, -1.0],
+                    [0.2, 1.5, -0.3],
+                ],
+                [
+                    [0.1, -0.2, 0.3],
+                    [1.0, 0.0, -1.0],
+                ],
+            ],
+            dtype=torch.float32,
+        )
+        responses = torch.tensor([[0, 1], [2, 0]], dtype=torch.long)
+        response_mask = torch.tensor([[True, True], [True, False]])
+
+        actor = DataParallelWasteSDDistillActor.__new__(DataParallelWasteSDDistillActor)
+        logits_mean, logits_max = actor._student_token_nll_stats(logits, responses, response_mask)
+
+        token_logp = DataParallelWasteSDDistillActor._gather_response_token_logprobs(logits, responses).detach()
+        token_mean, token_max = DataParallelWasteSDDistillActor._token_nll_stats_from_token_logprobs(
+            token_logp,
+            response_mask,
+        )
+
+        self.assertAlmostEqual(logits_mean, token_mean, places=6)
+        self.assertAlmostEqual(logits_max, token_max, places=6)
+
+    def test_gather_from_log_probs_matches_logsumexp_path(self):
+        torch.manual_seed(11)
+        logits = torch.randn(2, 4, 7, dtype=torch.float32)
+        responses = torch.tensor([[0, 6, 2, 1], [4, 3, 5, 0]], dtype=torch.long)
+
+        dense_logp = torch.log_softmax(logits.float(), dim=-1)
+        gathered_from_logp = DataParallelWasteSDDistillActor._gather_response_token_logprobs_from_log_probs(
+            dense_logp,
+            responses,
+        )
+        gathered_via_logsumexp = DataParallelWasteSDDistillActor._gather_response_token_logprobs_via_logsumexp(
+            logits,
+            responses,
+        )
+
+        self.assertTrue(torch.allclose(gathered_from_logp, gathered_via_logsumexp, atol=1e-6, rtol=0))
 
 
 class TestWasteSDAgentLoopConfigRewrite(unittest.TestCase):

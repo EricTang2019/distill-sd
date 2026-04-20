@@ -41,6 +41,45 @@ _SUPPORTED_TVD_REMBUDGET_BIAS_SCORE_TYPES = {"rembudget", "rembudget_tvd"}
 _SUPPORTED_REMBUDGET_TVD_OBJECTIVE_MODES = {"weighted_mean", "theorem_unnormalized"}
 
 
+def _sum_grad_square_from_tensors(grads: list[torch.Tensor | None] | tuple[torch.Tensor | None, ...]) -> float:
+    total = 0.0
+    for grad in grads:
+        if grad is not None:
+            total += float(torch.sum(torch.square(grad.detach().float())).item())
+    return total
+
+
+def _sum_grad_square_from_params(params: list[torch.nn.Parameter]) -> float:
+    total = 0.0
+    for param in params:
+        if param.grad is not None:
+            total += float(torch.sum(torch.square(param.grad.detach().float())).item())
+    return total
+
+
+def _backward_with_grad_square_hooks(
+    loss: torch.Tensor,
+    params: list[torch.nn.Parameter],
+) -> float:
+    total_sq = loss.detach().new_zeros((), dtype=torch.float32)
+    hook_handles = []
+
+    def _accumulate_grad_square(grad: torch.Tensor) -> torch.Tensor:
+        total_sq.add_(torch.sum(torch.square(grad.detach().float())))
+        return grad
+
+    for param in params:
+        hook_handles.append(param.register_hook(_accumulate_grad_square))
+
+    try:
+        loss.backward()
+    finally:
+        for handle in hook_handles:
+            handle.remove()
+
+    return float(total_sq.item())
+
+
 def _resolve_scheduled_coef(
     *,
     current_step: int,
@@ -732,6 +771,12 @@ class DataParallelWasteSDDistillActor(DataParallelPPOActor):
         self.log_post_update_batch_theorem_rb_tvd = bool(
             distill_config.get("log_post_update_batch_theorem_rb_tvd", False)
         )
+        self.log_micro_grad_noise_to_signal = bool(
+            distill_config.get("log_micro_grad_noise_to_signal", False)
+        )
+        self.micro_grad_noise_to_signal_eps = float(
+            distill_config.get("micro_grad_noise_to_signal_eps", 1e-12)
+        )
         self.strict = bool(distill_config.get("strict", True))
         self.forward_path = str(distill_config.get("forward_path", "auto")).lower()
         legacy_full_block_flag = distill_config.get("full_block_participate", None)
@@ -936,7 +981,7 @@ class DataParallelWasteSDDistillActor(DataParallelPPOActor):
             "distill/student_nll_all_response_tokens_mean": 0.0,
             "distill/token_count": 0.0,
         }
-        if self.log_current_batch_theorem_rb_tvd and self.loss_type == "tvd":
+        if self.log_current_batch_theorem_rb_tvd:
             micro_metrics["distill/current_batch_theorem_rb_tvd_mean_blocks"] = 0.0
             micro_metrics["distill/current_batch_theorem_rb_tvd_sum_blocks"] = 0.0
         if self._uses_theorem_unnormalized_rembudget_tvd():
@@ -1036,8 +1081,9 @@ class DataParallelWasteSDDistillActor(DataParallelPPOActor):
             coef=self.tvd_rembudget_bias_coef,
             start_step=self.tvd_rembudget_bias_start_step,
         )
-        log_current_batch_theorem_rb_tvd = self.log_current_batch_theorem_rb_tvd and self.loss_type == "tvd"
-        log_post_update_batch_theorem_rb_tvd = self.log_post_update_batch_theorem_rb_tvd and self.loss_type == "tvd"
+        log_current_batch_theorem_rb_tvd = self.log_current_batch_theorem_rb_tvd
+        log_post_update_batch_theorem_rb_tvd = self.log_post_update_batch_theorem_rb_tvd
+        log_micro_grad_noise_to_signal = self.log_micro_grad_noise_to_signal
         self.actor_module.train()
         if self.teacher_module is None:
             raise RuntimeError(
@@ -1097,6 +1143,7 @@ class DataParallelWasteSDDistillActor(DataParallelPPOActor):
             theorem_total_sample_count = 0.0
             theorem_total_token_count = 0.0
             trainable_params = [param for param in self.actor_module.parameters() if param.requires_grad]
+            micro_grad_sq_sums: list[float] = []
             exact_grad_buffers: list[torch.Tensor | None] = [None] * len(trainable_params)
             local_has_contrib_flags: list[bool] = []
             micro_records: list[dict[str, Any]] = []
@@ -1309,7 +1356,7 @@ class DataParallelWasteSDDistillActor(DataParallelPPOActor):
                                 "distill/rembudget_bias_score_mean": score_mean.tolist(),
                                 "distill/rembudget_bias_score_max": score_max.tolist(),
                             }
-                        elif self.loss_type == "tvd" and log_current_batch_theorem_rb_tvd:
+                        elif log_current_batch_theorem_rb_tvd:
                             with torch.no_grad():
                                 teacher_token_logprobs = self._gather_response_token_logprobs_via_logsumexp(
                                     teacher_logits,
@@ -1411,7 +1458,19 @@ class DataParallelWasteSDDistillActor(DataParallelPPOActor):
                         )
                         contributing_samples += 1
                 else:
-                    need_shared_dense_tvd = self.loss_type == "tvd"
+                    # Pure rembudget TVD does not need the shared dense token-TVD graph.
+                    # Keeping that graph around materially increases peak backward memory
+                    # versus the older loss_fn path, which is enough to tip long 4-GPU
+                    # runs over the edge. We only force the shared dense TVD path when
+                    # the objective itself needs it: theorem-unnormalized TVD or TVD
+                    # mixed with an unweighted FKL term.
+                    need_shared_dense_tvd = (
+                        self.loss_type == "tvd"
+                        and (
+                            theorem_unnormalized_rembudget_tvd
+                            or rembudget_tvd_unweighted_fkl_coef > 0.0
+                        )
+                    )
                     need_dense_log_probs = (
                         soft_distill_needs_dense_log_probs(
                             loss_type=self.loss_type,
@@ -1636,7 +1695,7 @@ class DataParallelWasteSDDistillActor(DataParallelPPOActor):
                             flat_mask = response_mask.reshape(-1)
                             token_div_flat = token_div.reshape(-1)[flat_mask]
                             weight_flat = token_weights.reshape(-1)[flat_mask].to(dtype=torch.float32)
-                            if log_current_batch_theorem_rb_tvd and self.loss_type == "tvd":
+                            if log_current_batch_theorem_rb_tvd:
                                 theorem_metric_token_tvd = token_div.detach()
                             if token_div_flat.numel() == 0:
                                 micro_weighted_sum = student_logits.new_zeros((), dtype=torch.float32)
@@ -1817,7 +1876,6 @@ class DataParallelWasteSDDistillActor(DataParallelPPOActor):
                                 micro_metrics.update(self._reduce_sample_metrics(sample_level_metrics))
                                 if (
                                     log_current_batch_theorem_rb_tvd
-                                    and self.loss_type == "tvd"
                                     and forward_weight_result is not None
                                     and theorem_metric_token_tvd is None
                                 ):
@@ -1859,11 +1917,7 @@ class DataParallelWasteSDDistillActor(DataParallelPPOActor):
                                     micro_objective = micro_weighted_mean
                                     micro_metrics["actor/distill_loss"] = micro_objective.detach().item()
 
-                        if (
-                            log_current_batch_theorem_rb_tvd
-                            and self.loss_type == "tvd"
-                            and forward_weight_result is not None
-                        ):
+                        if log_current_batch_theorem_rb_tvd and forward_weight_result is not None:
                             if theorem_metric_blocks is not None:
                                 theorem_blocks = theorem_metric_blocks
                             elif theorem_metric_token_tvd is not None:
@@ -1894,10 +1948,13 @@ class DataParallelWasteSDDistillActor(DataParallelPPOActor):
                     # Keep FSDP collectives aligned even when this rank has no valid tokens.
                     scaled_loss = student_logits.sum() * 0.0
 
-                if self.scaler is not None:
-                    self.scaler.scale(scaled_loss).backward()
+                loss_for_backward = self.scaler.scale(scaled_loss) if self.scaler is not None else scaled_loss
+                if log_micro_grad_noise_to_signal:
+                    micro_grad_sq_sums.append(
+                        _backward_with_grad_square_hooks(loss_for_backward, trainable_params)
+                    )
                 else:
-                    scaled_loss.backward()
+                    loss_for_backward.backward()
                 micro_records.append(
                     {
                         "metrics": micro_metrics,
@@ -1942,6 +1999,28 @@ class DataParallelWasteSDDistillActor(DataParallelPPOActor):
                 append_to_dict(metrics, micro_metrics)
 
             if global_has_contrib:
+                if log_micro_grad_noise_to_signal and len(micro_grad_sq_sums) > 1:
+                    grad_mean_sq = _sum_grad_square_from_params(trainable_params) / float(
+                        len(micro_grad_sq_sums) ** 2
+                    )
+                    grad_second_moment = sum(micro_grad_sq_sums) / float(len(micro_grad_sq_sums))
+                    var_trace = (float(len(micro_grad_sq_sums)) / float(len(micro_grad_sq_sums) - 1)) * max(
+                        0.0,
+                        grad_second_moment - grad_mean_sq,
+                    )
+                    noise_to_signal = var_trace / max(
+                        grad_mean_sq,
+                        self.micro_grad_noise_to_signal_eps,
+                    )
+                    append_to_dict(
+                        metrics,
+                        {
+                            "distill/micro_grad_mean_sq": grad_mean_sq,
+                            "distill/micro_grad_var_trace": var_trace,
+                            "distill/micro_grad_noise_to_signal": noise_to_signal,
+                            "distill/micro_grad_count": float(len(micro_grad_sq_sums)),
+                        },
+                    )
                 if self.loss_type == "exact_block_count_wnll":
                     if exact_unweighted_aux_coef <= 0.0 and exact_total_weight_sum > 0.0:
                         grad_scale = 1.0 / float(exact_total_weight_sum)

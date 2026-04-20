@@ -96,6 +96,16 @@ distill:
   # immediately after optimizer.step(). Logged only as a metric.
   # Used for any TVD run so unweighted and rembudget can be compared fairly.
   log_post_update_batch_theorem_rb_tvd: false
+  # Optional micro-batch gradient dispersion diagnostic on the current mini-batch.
+  # Logs:
+  #   distill/micro_grad_var_trace
+  #   distill/micro_grad_noise_to_signal = VarTrace / (||g_bar||^2 + eps)
+  # where the micro-gradients are the exact per-micro contributions used by backward
+  # in the current actor step. This is exact on single-GPU runs and a useful local proxy
+  # on multi-GPU runs. Adds extra backward-time overhead because it uses autograd.grad
+  # once per micro-batch before the real backward call.
+  log_micro_grad_noise_to_signal: false
+  micro_grad_noise_to_signal_eps: 1e-12
   # Optional convex mixing coefficient for exact omega + unweighted auxiliary loss.
   # Only used when loss_type=exact_block_count_wnll.
   #   loss = (1 - exact_unweighted_aux_coef) * exact_wNLL + exact_unweighted_aux_coef * unweighted_aux

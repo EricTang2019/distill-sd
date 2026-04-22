@@ -20,6 +20,9 @@ from verl import DataProto
 class WasteSDTeacherOffPolicyRayTrainer(WasteSDRayTrainer):
     """Teacher-only rollout off-policy distillation baseline."""
 
+    def _stale_filter_enabled(self) -> bool:
+        return False
+
     def _attach_weight_version(self, source_batch, gen_batch) -> None:
         # Off-policy baseline uses fixed teacher rollout; no version tagging needed.
         return

@@ -47,7 +47,8 @@ def main(config):
         # - rollout from student/actor
         # - teacher comes from local ref model
         # - unweighted token-level mean distillation
-        config.distill.weighting_mode = "uniform_mean"
+        if config.distill.get("weighting_mode", None) in {None, "waste"}:
+            config.distill.weighting_mode = "uniform_mean"
         if config.distill.get("gamma", None) is None:
             config.distill.gamma = 1
         config.distill.q_source = "local_ref"

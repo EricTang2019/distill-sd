@@ -255,16 +255,16 @@ if [[ -n "${WASTE_SD_BLOCK_EVAL_ROLLOUT_DATA_DIR}" ]]; then
 fi
 
 EXACT_BLOCKS_EVAL_OVERRIDES=(
-  "+trainer.exact_blocks_eval_freq=${WASTE_SD_EXACT_BLOCKS_EVAL_FREQ}"
-  "+trainer.exact_blocks_eval_batch_size=${WASTE_SD_EXACT_BLOCKS_EVAL_BATCH_SIZE}"
-  "+trainer.exact_blocks_eval_max_samples=${WASTE_SD_EXACT_BLOCKS_EVAL_MAX_SAMPLES}"
-  "+trainer.exact_blocks_eval_max_prompt_length=${WASTE_SD_EXACT_BLOCKS_EVAL_MAX_PROMPT_LENGTH}"
-  "+trainer.exact_blocks_eval_max_response_length=${WASTE_SD_EXACT_BLOCKS_EVAL_MAX_RESPONSE_LENGTH}"
-  "+trainer.exact_blocks_eval_truncation=${WASTE_SD_EXACT_BLOCKS_EVAL_TRUNCATION}"
-  "+trainer.exact_blocks_eval_temperature=${WASTE_SD_EXACT_BLOCKS_EVAL_TEMPERATURE}"
+  "trainer.exact_blocks_eval_freq=${WASTE_SD_EXACT_BLOCKS_EVAL_FREQ}"
+  "trainer.exact_blocks_eval_batch_size=${WASTE_SD_EXACT_BLOCKS_EVAL_BATCH_SIZE}"
+  "trainer.exact_blocks_eval_max_samples=${WASTE_SD_EXACT_BLOCKS_EVAL_MAX_SAMPLES}"
+  "trainer.exact_blocks_eval_max_prompt_length=${WASTE_SD_EXACT_BLOCKS_EVAL_MAX_PROMPT_LENGTH}"
+  "trainer.exact_blocks_eval_max_response_length=${WASTE_SD_EXACT_BLOCKS_EVAL_MAX_RESPONSE_LENGTH}"
+  "trainer.exact_blocks_eval_truncation=${WASTE_SD_EXACT_BLOCKS_EVAL_TRUNCATION}"
+  "trainer.exact_blocks_eval_temperature=${WASTE_SD_EXACT_BLOCKS_EVAL_TEMPERATURE}"
 )
 if [[ -n "${WASTE_SD_EXACT_BLOCKS_EVAL_DATA_FILE}" ]]; then
-  EXACT_BLOCKS_EVAL_OVERRIDES+=("+trainer.exact_blocks_eval_data_file=${WASTE_SD_EXACT_BLOCKS_EVAL_DATA_FILE}")
+  EXACT_BLOCKS_EVAL_OVERRIDES+=("trainer.exact_blocks_eval_data_file=${WASTE_SD_EXACT_BLOCKS_EVAL_DATA_FILE}")
 fi
 
 RUNTIME_ENV_OVERRIDES=(

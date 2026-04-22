@@ -104,6 +104,44 @@ class WasteSDRayTrainer(RayPPOTrainer):
         )
         self._exact_blocks_eval_freq = int(self.config.trainer.get("exact_blocks_eval_freq", -1))
 
+    def _stale_filter_enabled(self) -> bool:
+        return True
+
+    def _build_compare_config_metrics(self) -> dict[str, float]:
+        loss_type = str(self.distill_cfg.get("loss_type", "")).lower()
+        weighting_mode = str(self.distill_cfg.get("weighting_mode", "")).lower()
+        rollout_target = str(self.distill_cfg.get("rollout_target", "local_ref")).lower()
+        teacher_forward_backend = str(self.distill_cfg.get("teacher_forward_backend", "")).lower()
+        return {
+            "distill_config/data_mode_online_rollout": float(self.data_mode == "online_rollout"),
+            "distill_config/data_mode_offline_teacher_rollout": float(self.data_mode == "offline_teacher_rollout"),
+            "distill_config/rollout_target_actor": float(rollout_target == "actor"),
+            "distill_config/rollout_target_local_ref": float(rollout_target == "local_ref"),
+            "distill_config/loss_type_tvd": float(loss_type == "tvd"),
+            "distill_config/loss_type_fkl": float(loss_type == "fkl"),
+            "distill_config/weighting_mode_uniform_mean": float(weighting_mode == "uniform_mean"),
+            "distill_config/weighting_mode_remaining_budget_forward": float(
+                weighting_mode == "remaining_budget_forward"
+            ),
+            "distill_config/teacher_forward_backend_fsdp_ref": float(teacher_forward_backend == "fsdp_ref"),
+            "distill_config/teacher_forward_backend_local_replica": float(
+                teacher_forward_backend == "local_replica"
+            ),
+            "distill_config/log_current_batch_theorem_rb_tvd": float(
+                bool(self.distill_cfg.get("log_current_batch_theorem_rb_tvd", False))
+            ),
+            "distill_config/log_post_update_batch_theorem_rb_tvd": float(
+                bool(self.distill_cfg.get("log_post_update_batch_theorem_rb_tvd", False))
+            ),
+            "distill_config/off_policy_require_ref": float(bool(self.distill_cfg.get("off_policy_require_ref", False))),
+            "distill_config/stale_filter_enabled": float(self._stale_filter_enabled()),
+            "distill_config/staleness_max_version_gap": float(self.staleness_max_version_gap),
+            "distill_config/gamma": float(int(self.distill_cfg.get("gamma", 1))),
+            "distill_config/exact_blocks_eval_enabled": float(
+                self._exact_blocks_eval_freq > 0 and bool(self._exact_blocks_eval_data_files)
+            ),
+        }
+
     def _maybe_run_exact_blocks_eval(self, *, logger, global_step: int, is_last_step: bool, temperature: float) -> dict[str, float]:
         if not exact_blocks_eval_should_run(
             freq=self._exact_blocks_eval_freq,
@@ -831,6 +869,11 @@ class WasteSDRayTrainer(RayPPOTrainer):
         self._initialize_rollout_state()
 
         current_epoch = self.global_steps // len(self.train_dataloader)
+
+        config_metrics = self._build_compare_config_metrics()
+        config_metrics["training/global_step"] = self.global_steps
+        config_metrics["training/epoch"] = float(current_epoch)
+        logger.log(data=config_metrics, step=self.global_steps)
 
         if self.config.trainer.get("val_only", False):
             pprint("waste_sd trainer has no reward-based validation in v1. Skip val_only.")
